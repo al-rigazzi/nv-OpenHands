@@ -15,7 +15,7 @@ import tenacity
 
 import openhands
 from openhands.core.config import OpenHandsConfig
-from openhands.core.exceptions import AgentRuntimeDisconnectedError
+from openhands.core.exceptions import AgentRuntimeDisconnectedError, ServerProcessDied
 from openhands.core.logger import openhands_logger as logger
 from openhands.events import EventStream
 from openhands.events.action import (
@@ -415,6 +415,7 @@ class LocalRuntime(ActionExecutionClient):
     @tenacity.retry(
         wait=tenacity.wait_fixed(2),
         stop=tenacity.stop_after_delay(300) | stop_if_should_exit(),
+        retry=tenacity.retry_if_not_exception_type(ServerProcessDied),
         before_sleep=lambda retry_state: logger.debug(
             f'Waiting for server to be ready... (attempt {retry_state.attempt_number})'
         ),
@@ -422,7 +423,7 @@ class LocalRuntime(ActionExecutionClient):
     def _wait_until_alive(self) -> bool:
         """Wait until the server is ready to accept requests."""
         if self.server_process and self.server_process.poll() is not None:
-            raise RuntimeError('Server process died')
+            raise ServerProcessDied('Server process died')
 
         try:
             response = self.session.get(f'{self.api_url}/alive')
@@ -776,13 +777,14 @@ def _create_warm_server(
         @tenacity.retry(
             wait=tenacity.wait_fixed(2),
             stop=tenacity.stop_after_delay(120) | stop_if_should_exit(),
+            retry=tenacity.retry_if_not_exception_type(ServerProcessDied),
             before_sleep=lambda retry_state: logger.debug(
                 f'Waiting for warm server to be ready... (attempt {retry_state.attempt_number})'
             ),
         )
         def wait_until_alive() -> bool:
             if server_info.process.poll() is not None:
-                raise RuntimeError('Warm server process died')
+                raise ServerProcessDied('Warm server process died')
 
             try:
                 response = session.get(f'{api_url}/alive')

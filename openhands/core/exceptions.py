@@ -191,6 +191,17 @@ class AgentRuntimeDisconnectedError(AgentRuntimeUnavailableError):
     pass
 
 
+class ServerProcessDied(AgentRuntimeDisconnectedError):
+    """The local action_execution_server subprocess exited.
+
+    Non-retryable: a dead local subprocess will not resurrect, so tenacity
+    must re-raise this immediately instead of burning its retry budget polling
+    a process that can never come back.
+    """
+
+    pass
+
+
 class AgentRuntimeNotFoundError(AgentRuntimeUnavailableError):
     """Exception raised when an agent runtime is not found."""
 
