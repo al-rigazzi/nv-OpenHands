@@ -308,14 +308,15 @@ class BashSession:
             # This starts a non-login (new) shell for the given user
             _shell_command = f"su {self.username} -"
 
-        # FIXME: we will introduce memory limit using sysbox-runc in coming PR
-        # # otherwise, we are running as the CURRENT USER (e.g., when running LocalRuntime)
-        # if self.max_memory_mb is not None:
-        #     window_command = (
-        #         f'prlimit --as={self.max_memory_mb * 1024 * 1024} {_shell_command}'
-        #     )
-        # else:
-        window_command = _shell_command
+        # Cap the address space of the command shell and its children so a
+        # runaway allocation fails inside the episode as MemoryError instead
+        # of ballooning until a memory watchdog kills the whole container.
+        if self.max_memory_mb is not None:
+            window_command = (
+                f'prlimit --as={self.max_memory_mb * 1024 * 1024} {_shell_command}'
+            )
+        else:
+            window_command = _shell_command
 
         logger.debug(
             f"Initializing bash session in {self.work_dir} with command: {window_command}"

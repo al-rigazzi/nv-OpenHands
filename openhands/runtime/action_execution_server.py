@@ -243,8 +243,12 @@ class ActionExecutor:
         self.downloads_directory = '/workspace/.downloads'
         self._todos: list[dict] = []  # In-memory todo list storage
 
+        # Default 16GB address-space cap for agent-run commands; a runaway
+        # allocation fails in-command as MemoryError instead of ballooning
+        # until an external watchdog kills the container. Opt out with
+        # RUNTIME_MAX_MEMORY_GB=0.
         self.max_memory_gb: int | None = None
-        if _override_max_memory_gb := os.environ.get('RUNTIME_MAX_MEMORY_GB', None):
+        if _override_max_memory_gb := os.environ.get('RUNTIME_MAX_MEMORY_GB', '16'):
             self.max_memory_gb = int(_override_max_memory_gb)
             logger.info(
                 f'Setting max memory to {self.max_memory_gb}GB (according to the RUNTIME_MAX_MEMORY_GB environment variable)'
