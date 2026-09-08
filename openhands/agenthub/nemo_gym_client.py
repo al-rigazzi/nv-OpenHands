@@ -22,6 +22,19 @@ if TYPE_CHECKING:
     from openhands.core.message import Message
     from openhands.llm.llm import LLM, ModelResponse
 
+# litellm kwargs that configure the client and are never part of the OpenAI
+# chat/completions request body. The Gym server validates requests against
+# openai-pinned schemas with extra="forbid" and rejects unknown fields.
+LITELLM_CLIENT_ONLY_PARAMS = (
+    "aws_region_name",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "top_k",
+    "thinking",
+    "allowed_openai_params",
+    "safety_settings",
+)
+
 
 class NemoGymClient:
     """Client that proxies LLM completions through the NeMo Gym server.
@@ -81,6 +94,13 @@ class NemoGymClient:
         }
         if tools:
             params["tools"] = tools
+
+        for field in LITELLM_CLIENT_ONLY_PARAMS:
+            params.pop(field, None)
+        for message in message_dicts:
+            # Internal bookkeeping field; OpenAI tool messages have no "name".
+            if message.get("role") == "tool":
+                message.pop("name", None)
 
         fields_to_remove = [
             "prompt_token_ids",
