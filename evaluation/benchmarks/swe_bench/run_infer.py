@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import copy
 import json
 import os
@@ -768,15 +769,26 @@ def complete_runtime(
                     git_patch = obs.content
                     break
                 elif isinstance(obs, ErrorObservation):
-                    # Fall back to cat "patch.diff" to get the patch
+                    # Keep undecodable patch bytes out of the interactive terminal.
                     assert 'File could not be decoded as utf-8' in obs.content
-                    action = CmdRunAction(command='cat patch.diff')
+                    action = CmdRunAction(
+                        command='base64 < patch.diff > patch.diff.base64'
+                    )
                     action.set_hard_timeout(max(300 + 100 * n_retries, 600))
                     logger.info(action, extra={'msg_type': 'ACTION'})
                     obs = runtime.run_action(action)
                     assert isinstance(obs, CmdOutputObservation) and obs.exit_code == 0
                     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-                    git_patch = obs.content
+                    action = FileReadAction(path='patch.diff.base64')
+                    action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+                    obs = runtime.run_action(action)
+                    assert_and_raise(
+                        isinstance(obs, FileReadObservation),
+                        f'Failed to read encoded git patch: {obs}',
+                    )
+                    git_patch = base64.b64decode(
+                        obs.content.replace('\n', ''), validate=True
+                    )
                     break
                 else:
                     assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
@@ -797,6 +809,11 @@ def complete_runtime(
     logger.info('-' * 30)
     logger.info('END Runtime Completion Fn')
     logger.info('-' * 30)
+    if isinstance(git_patch, bytes):
+        return {
+            'git_patch': None,
+            'git_patch_b64': base64.b64encode(git_patch).decode('ascii'),
+        }
     return {'git_patch': git_patch}
 
 
@@ -819,7 +836,10 @@ def _has_existing_result(eval_output_dir: str, instance_id: str) -> tuple[bool, 
                     try:
                         result = json.loads(line.strip())
                         if result.get('instance_id') == instance_id:
-                            git_patch = result.get('test_result', {}).get('git_patch', '')
+                            test_result = result.get('test_result', {})
+                            git_patch = test_result.get('git_patch') or test_result.get(
+                                'git_patch_b64'
+                            )
                             if git_patch and git_patch.strip():
                                 existing_result = result
                                 break
@@ -970,7 +990,7 @@ def process_instance(
         else:
             complete_runtime_fn = complete_runtime
         return_val = complete_runtime_fn(runtime, instance)
-        git_patch = return_val['git_patch']
+        git_patch = return_val.get('git_patch_b64', return_val['git_patch'])
         logger.info(
             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
         )
@@ -982,9 +1002,7 @@ def process_instance(
     # ======= Attempt to evaluate the agent's edits =======
     # we use eval_infer.sh to evaluate the agent's edits, not here
     # because the agent may alter the environment / testcases
-    test_result = {
-        'git_patch': git_patch,
-    }
+    test_result = return_val
 
     # If you are working on some simpler benchmark that only evaluates the final model output (e.g., in a MessageAction)
     # You can simply get the LAST `MessageAction` from the returned `state.history` and parse it for evaluation.
