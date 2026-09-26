@@ -118,7 +118,7 @@ def _attribute_path(git, name):
     )
 
 
-def prepare(repo, base, context, whitespace='fix', timeout=60):
+def prepare(repo, base, context, whitespace='fix', timeout=600):
     """Snapshot a clean base and the initial evaluator attribute policy."""
     repo, context = Path(repo).resolve(), Path(context).resolve()
     if context == repo or repo in context.parents:
@@ -266,7 +266,7 @@ def _binary_body(git, directory, old, new):
     return marker + body
 
 
-def normalize(context, patch, output, timeout=60):
+def normalize(context, patch, output, timeout=600):
     """Write a UTF-8 patch while retaining operation identity and valid blocks."""
     context = Path(context).resolve()
     state = json.loads((context / 'state.json').read_text(encoding='ascii'))
@@ -356,7 +356,7 @@ def main():
         command = commands.add_parser(operation)
         for path in paths:
             command.add_argument('--' + path, required=True)
-        command.add_argument('--timeout', type=float, default=60)
+        command.add_argument('--timeout', type=float, default=600)
         if operation == 'prepare':
             command.add_argument('--whitespace', choices=('fix', 'nowarn'), default='fix')
     args = vars(parser.parse_args())

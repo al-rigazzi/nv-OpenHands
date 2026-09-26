@@ -399,7 +399,7 @@ def _prepare_portable_patch(runtime: Runtime, instance):
     """Capture patch-application policy before agent edits, inside its sandbox."""
     directory = f'/tmp/openhands-patch-{uuid.uuid4().hex}'
     action = CmdRunAction(command=f'mkdir -m 700 {shlex.quote(directory)}')
-    action.set_hard_timeout(60)
+    action.set_hard_timeout(600)
     obs = runtime.run_action(action)
     assert_and_raise(
         isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
@@ -414,10 +414,10 @@ def _prepare_portable_patch(runtime: Runtime, instance):
     command = shlex.join([
         'python', directory + '/portable_patch.py', 'prepare', '--repo', workspace,
         '--base', instance['base_commit'], '--context', directory + '/state',
-        '--whitespace', whitespace,
+        '--whitespace', whitespace, '--timeout', '600',
     ])
     action = CmdRunAction(command=command)
-    action.set_hard_timeout(90)
+    action.set_hard_timeout(600)
     obs = runtime.run_action(action)
     assert_and_raise(
         isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
@@ -823,12 +823,15 @@ def complete_runtime(
                         'Missing pre-agent portable patch context',
                     )
                     portable_path = directory + '/patch.diff'
+                    # Preserve the original extraction fallback's retry budget,
+                    # including the helper's internal Git deadline.
+                    timeout = max(300 + 100 * n_retries, 600)
                     action = CmdRunAction(command=shlex.join([
                         'python', directory + '/portable_patch.py', 'normalize',
                         '--context', directory + '/state', '--patch', 'patch.diff',
-                        '--output', portable_path,
+                        '--output', portable_path, '--timeout', str(timeout),
                     ]))
-                    action.set_hard_timeout(90)
+                    action.set_hard_timeout(timeout)
                     logger.info(action, extra={'msg_type': 'ACTION'})
                     obs = runtime.run_action(action)
                     assert_and_raise(
@@ -837,7 +840,7 @@ def complete_runtime(
                     )
                     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
                     action = FileReadAction(path=portable_path)
-                    action.set_hard_timeout(90)
+                    action.set_hard_timeout(timeout)
                     obs = runtime.run_action(action)
                     assert_and_raise(
                         isinstance(obs, FileReadObservation),

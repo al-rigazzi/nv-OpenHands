@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -251,6 +252,35 @@ def test_rejects_initial_tracked_drift_and_zero_deadline(case):
         prepare(repo, base, context)
     with pytest.raises(PatchConversionError, match='time budget'):
         prepare(repo, base, context, timeout=0)
+
+
+@pytest.mark.parametrize("operation", ["prepare", "normalize"])
+def test_default_budget_allows_git_work_after_ninety_seconds(case, monkeypatch, operation):
+    repo, context, base = case
+    patch, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    if operation == 'normalize':
+        prepare(repo, base, context)
+        (repo / 'file.txt').write_bytes(b'changed \xff\n')
+        git(repo, 'add', '-A')
+        patch.write_bytes(git(repo, 'diff', '--cached', base))
+    clock = [0]
+    monkeypatch.setattr(
+        'evaluation.benchmarks.swe_bench.portable_patch.time',
+        SimpleNamespace(monotonic=lambda: clock[0]),
+    )
+    original = Git.run
+
+    def delayed_git(self, *args, **kwargs):
+        clock[0] = 120  # Simulate slow work without a real two-minute sleep.
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Git, 'run', delayed_git)
+    if operation == 'prepare':
+        prepare(repo, base, context)
+        assert (context / 'state.json').is_file()
+    else:
+        normalize(context, patch, output)
+        assert 'GIT binary patch' in output.read_text(encoding='utf-8')
 
 
 def test_old_git_attribute_path_fallback(case, monkeypatch):

@@ -80,9 +80,50 @@ def test_invalid_utf8_uses_portable_file_and_legacy_schema(patch_runtime, payloa
     assert complete_runtime(runtime, INSTANCE) == {"git_patch": "portable UTF-8 patch\n"}
     calls = [c.args[0] for c in runtime.run_action.call_args_list]
     normalization = next(c for c in calls if isinstance(c, CmdRunAction) and "normalize" in c.command)
-    assert normalization.hard_timeout == 90
-    assert shlex.split(normalization.command)[-2:] == ["--output", runtime._swe_patch_context + "/patch.diff"]
+    assert normalization.hard_timeout == 600
+    command = shlex.split(normalization.command)
+    assert command[command.index("--output") + 1] == runtime._swe_patch_context + "/patch.diff"
+    assert command[command.index("--timeout") + 1] == "600"
     assert isinstance(calls[-1], FileReadAction)
+    assert calls[-1].hard_timeout == 600
+
+
+@pytest.mark.parametrize("failed_attempts", range(5))
+@pytest.mark.parametrize("portable", [False, True])
+def test_extraction_preserves_original_retry_timeouts(
+    patch_runtime, monkeypatch, failed_attempts, portable
+):
+    runtime, patch_file, _ = patch_runtime
+    patch_file.write_bytes(PREFIX + (b"\xff" if portable else b"text") + b"\n")
+    original = runtime.run_action.side_effect
+    attempts = 0
+
+    def run_action(action):
+        nonlocal attempts
+        if isinstance(action, CmdRunAction) and action.command.startswith("git diff "):
+            attempts += 1
+            if attempts <= failed_attempts:
+                return CmdOutputObservation(content="retry", command=action.command, exit_code=1)
+        return original(action)
+
+    runtime.run_action.side_effect = run_action
+    monkeypatch.setattr(
+        "evaluation.benchmarks.swe_bench.run_infer.sleep_if_should_continue",
+        lambda seconds: None, raising=False,
+    )
+    complete_runtime(runtime, INSTANCE)
+    calls = [call.args[0] for call in runtime.run_action.call_args_list]
+    diffs = [call for call in calls if isinstance(call, CmdRunAction) and call.command.startswith("git diff ")]
+    assert [call.hard_timeout for call in diffs] == [600, 600, 600, 600, 700][:failed_attempts + 1]
+    # The original code increments n_retries before reading/falling back.
+    expected = [600, 600, 600, 700, 800][failed_attempts]
+    reads = [call for call in calls if isinstance(call, FileReadAction)]
+    assert [call.hard_timeout for call in reads] == [expected] * (2 if portable else 1)
+    if portable:
+        normalization = next(call for call in calls if isinstance(call, CmdRunAction) and "normalize" in shlex.split(call.command))
+        command = shlex.split(normalization.command)
+        assert normalization.hard_timeout == expected
+        assert float(command[command.index("--timeout") + 1]) == expected
 
 
 def test_missing_pre_agent_context_is_reported(patch_runtime):
@@ -124,8 +165,11 @@ def test_preparation_copies_helper_and_captures_policy(patch_runtime, monkeypatc
     _prepare_portable_patch(runtime, INSTANCE)
     runtime.copy_to.assert_called_once()
     assert runtime.copy_to.call_args.args[0].endswith("/portable_patch.py")
-    command = shlex.split(runtime.run_action.call_args.args[0].command)
-    assert command[-2:] == ["--whitespace", policy]
+    preparation = runtime.run_action.call_args.args[0]
+    command = shlex.split(preparation.command)
+    assert command[command.index("--whitespace") + 1] == policy
+    assert preparation.hard_timeout == 600
+    assert command[command.index("--timeout") + 1] == "600"
     assert command[command.index("--base") + 1] == "base"
     assert runtime._swe_patch_context.startswith("/tmp/openhands-patch-")
 
