@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 import pytest
 
@@ -319,3 +320,41 @@ def test_prepare_does_not_mutate_source(case):
     prepare(repo, base, context)
     assert {p: p.read_bytes() for p in tracked} == before
     assert git(repo, 'rev-parse', 'HEAD') == head
+
+
+def test_cli_failure_diagnostics_cannot_emit_terminal_controls(case):
+    repo, context, _ = case
+    (repo / 'z.txt').write_bytes(b'old second\n')
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-qm', 'two-file base')
+    base = git(repo, 'rev-parse', 'HEAD').decode().strip()
+    prepare(repo, base, context)
+    (repo / 'file.txt').write_bytes(b'changed \xff\x1bPunterminated\r  \t\n')
+    (repo / 'z.txt').write_bytes(b'new second\n')
+    git(repo, 'add', '-A')
+    raw = git(repo, 'diff', '--cached', base).replace(
+        b'-old second\n', b'-not the old second\n'
+    )
+    patch, output = repo.parent / 'bad.patch', repo.parent / 'output.patch'
+    patch.write_bytes(raw)
+    result = subprocess.run(
+        [
+            sys.executable,
+            prepare.__code__.co_filename,
+            'normalize',
+            '--context',
+            str(context),
+            '--patch',
+            str(patch),
+            '--output',
+            str(output),
+        ],
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == 1 and not output.exists()
+    assert result.stdout == b''
+    assert result.stderr.endswith(b'\n')
+    assert all(32 <= byte < 127 for byte in result.stderr[:-1])
+    assert b'<0xff><0x1b>Punterminated<0x0d>' in result.stderr
+    assert b'z.txt: patch does not apply' in result.stderr

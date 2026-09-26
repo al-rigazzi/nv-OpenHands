@@ -62,7 +62,10 @@ class Git:
             ) from exc
         if result.returncode not in allowed:
             # Git diagnostics can contain undecodable source bytes; never emit them raw.
-            detail = result.stderr[:2048].decode('ascii', errors='backslashreplace')
+            detail = ''.join(
+                chr(byte) if 32 <= byte < 127 else f'<0x{byte:02x}>'
+                for byte in result.stderr[:2048]
+            )
             raise PatchConversionError(f'Git failed ({result.returncode}): {detail}')
         return result.stdout
 
@@ -418,9 +421,7 @@ def main():
         (prepare if operation == 'prepare' else normalize)(**args)
     except Exception as exc:
         print(
-            ('Patch conversion failed: ' + str(exc))
-            .encode('ascii', 'backslashreplace')
-            .decode('ascii'),
+            'Patch conversion failed: ' + ascii(str(exc)),
             file=sys.stderr,
         )
         return 1
