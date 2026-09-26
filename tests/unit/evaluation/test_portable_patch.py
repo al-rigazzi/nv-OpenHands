@@ -48,7 +48,7 @@ def case(tmp_path, monkeypatch):
     return repo, tmp_path / 'context', git(repo, 'rev-parse', 'HEAD').decode().strip()
 
 
-def convert(case, edits, policy='fix'):
+def convert(case, edits, policy='fix', diff_args=()):
     repo, context, base = case
     reference, target = repo.parent / 'reference', repo.parent / 'target'
     shutil.copytree(repo, reference)
@@ -56,7 +56,7 @@ def convert(case, edits, policy='fix'):
     prepare(repo, base, context, whitespace=policy)
     edits(repo)
     git(repo, 'add', '-A')
-    raw = git(repo, 'diff', '--no-color', '--cached', base)
+    raw = git(repo, 'diff', '--no-color', '--cached', *diff_args, base)
     selected = b''.join(_filter_blocks(raw))
     patch, output = repo.parent / 'raw.patch', repo.parent / 'portable.patch'
     patch.write_bytes(raw)
@@ -192,6 +192,8 @@ def test_normalized_identity_is_nonempty_applicable_patch(case):
         case, lambda r: (r / 'file.txt').write_bytes(b'old \xff  \t\n')
     )
     assert portable.strip() and (target / 'file.txt').read_bytes() == b'old \xff\n'
+    git(target, 'apply', '--reverse', '-', data=portable)
+    assert (target / 'file.txt').read_bytes() == b'old \xff\n'
 
 
 def test_excluded_rename_does_not_become_source_deletion(case):
@@ -219,6 +221,14 @@ def test_filter_preserves_final_lf_before_dropped_block():
     kept = b'diff --git a/a b/a\n+bad \xff\x85\r\n'
     dropped = b'diff --git a/z b/z\nBinary files a/z and b/z differ\n'
     assert b''.join(_filter_blocks(kept + dropped)) == kept
+
+
+def test_filter_matches_legacy_header_and_body_selection():
+    kept = b'diff --git a/Binary files b/Binary files\n+bad \xff\rdata\n'
+    dropped = b'diff --git a/z b/z\n+text containing Binary files is also omitted\n'
+    final = b'diff --git a/last b/last\n+bad \xff\rdiff --git not a new block'
+    raw = b'Binary files in preamble\n' + kept + dropped + final
+    assert _filter_blocks(raw) == [kept, final]
 
 
 def test_empty_and_malformed(case):
@@ -290,20 +300,71 @@ def test_initial_policy_sources_survive_agent_changes(case, source):
     assert (repo / 'file.txt').read_bytes() == b'new \xff  \t\n'
 
 
-@pytest.mark.parametrize('name', ['old name.txt', 'old\tname.txt', 'old\nname.txt'])
-def test_quoted_rename_paths(case, name):
+@pytest.mark.parametrize('operation', ['rename', 'copy'])
+@pytest.mark.parametrize('name,quoted', [
+    ('old name.txt', True),
+    ('old\tname.txt', True),
+    ('old\nname.txt', True),
+    ('old caf\u00e9.txt', False),
+    ('old caf\u00e9\t"\\\n.txt', True),
+])
+def test_path_operations_preserve_identity_and_rename_reversal(
+    case, operation, name, quoted,
+):
     repo, context, _ = case
-    (repo / name).write_bytes(b'old \xff\n' * 30)
+    destination = 'new ' + name
+    original = b'old \xff\n' * 30
+    (repo / name).write_bytes(original)
+    git(repo, 'config', 'core.quotePath', str(quoted).lower())
     git(repo, 'add', '-A')
-    git(repo, 'commit', '-qm', 'named base')
+    git(repo, 'commit', '-qm', 'quoted source base')
     case = repo, context, git(repo, 'rev-parse', 'HEAD').decode().strip()
 
     def edits(repo):
-        (repo / name).rename(repo / ('new ' + name))
-        with (repo / ('new ' + name)).open('ab') as f:
-            f.write(b'added \xff\n')
+        if operation == 'rename':
+            (repo / name).rename(repo / destination)
+        else:
+            shutil.copyfile(repo / name, repo / destination)
+        with (repo / destination).open('ab') as handle:
+            handle.write(b'added \xff\n')
 
-    convert(case, edits)
+    raw, portable, target = convert(case, edits, diff_args=('--find-copies-harder',))
+    headers = [line for line in raw.split(b'\n') if line.startswith(operation.encode())]
+    assert len(headers) == 2 and all(line in portable for line in headers)
+    if operation == 'rename':
+        git(target, 'apply', '--reverse', '-', data=portable)
+        assert not (target / destination).exists()
+    assert (target / name).read_bytes() == original
+
+
+def test_publication_is_atomic_and_private(case, monkeypatch):
+    repo, context, base = case
+    prepare(repo, base, context)
+    (repo / 'file.txt').write_bytes(b'changed \xff\n')
+    git(repo, 'add', '-A')
+    patch, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    patch.write_bytes(git(repo, 'diff', '--cached', base))
+    output.write_bytes(b'previous patch')
+    before = set(repo.parent.iterdir())
+    replace = os.replace
+
+    def failed_replace(source, destination):
+        assert Path(source).stat().st_mode & 0o777 == 0o600
+        assert output.read_bytes() == b'previous patch'
+        raise OSError('publication failed')
+
+    monkeypatch.setattr(os, 'replace', failed_replace)
+    with pytest.raises(OSError, match='publication failed'):
+        normalize(context, patch, output)
+    assert output.read_bytes() == b'previous patch'
+    assert set(repo.parent.iterdir()) == before
+    monkeypatch.setattr(os, 'replace', replace)
+    normalize(context, patch, output)
+    assert output.stat().st_mode & 0o777 == 0o600
+    assert set(repo.parent.iterdir()) == before
+    git(repo, 'reset', '--hard', base)
+    git(repo, 'apply', str(output))
+    assert (repo / 'file.txt').read_bytes() == b'changed \xff\n'
 
 
 def test_prepare_does_not_mutate_source(case):

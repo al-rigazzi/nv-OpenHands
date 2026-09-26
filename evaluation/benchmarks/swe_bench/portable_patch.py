@@ -200,55 +200,26 @@ def prepare(repo, base, context, whitespace='fix', timeout=60):
 
 
 def _filter_blocks(raw):
-    """Match the existing byte-mode Binary files block selection, including LF."""
-    lines = raw.split(b'\n')
-    lines[:-1] = [line + b'\n' for line in lines[:-1]]
-    blocks, block, binary = [], [], False
-    for line in lines:
-        if line.startswith(b'diff --git '):
-            if block and not binary:
-                blocks.append(b''.join(block))
-            block, binary = [line], False
-        else:
-            if b'Binary files' in line:
-                binary = True
-            block.append(line)
-    if block and not binary:
-        blocks.append(b''.join(block))
-    return blocks
+    """Keep raw LF boundaries and the existing Binary files block selection."""
+    return [
+        block
+        for block in re.split(rb'(?m)(?=^diff --git )', raw)
+        if block and not any(
+            b'Binary files' in line
+            for line in block.split(b'\n')
+            if not line.startswith(b'diff --git ')
+        )
+    ]
 
 
-def _unquote(path):
-    if not path.startswith(b'"'):
-        return path
-    if not path.endswith(b'"'):
-        raise PatchConversionError('Malformed quoted Git path')
-    result = bytearray()
-    escapes = {
-        ord(k): v for k, v in zip('abfnrtv\\"', (7, 8, 12, 10, 13, 9, 11, 92, 34))
-    }
-    i = 1
-    while i < len(path) - 1:
-        value = path[i]
-        i += 1
-        if value != 92:
-            result.append(value)
-            continue
-        if i >= len(path) - 1:
-            raise PatchConversionError('Malformed Git path escape')
-        match = re.match(rb'[0-7]{1,3}', path[i:-1])
-        if match:
-            value = int(match[0], 8)
-            if value > 255:
-                raise PatchConversionError('Invalid Git path byte')
-            result.append(value)
-            i += len(match[0])
-        elif path[i] in escapes:
-            result.append(escapes[path[i]])
-            i += 1
-        else:
-            raise PatchConversionError('Unsupported Git path escape')
-    return bytes(result)
+def _patch_path(git, block, reverse=False):
+    # Let Git decode quoted rename/copy paths, including octal and control bytes.
+    flags = ('--reverse',) if reverse else ()
+    stats = git.run('apply', '--numstat', '-z', *flags, '-', data=block)
+    fields = stats.split(b'\t', 2)
+    if len(fields) != 3 or fields[2].count(b'\0') != 1 or not stats.endswith(b'\0'):
+        raise PatchConversionError('Unsupported multi-path patch block')
+    return fields[2][:-1]
 
 
 def _blob(git, tree, path):
@@ -276,24 +247,12 @@ def _binary_body(git, directory, old, new):
     if not (directory / '.git').exists():
         git.run('init', '-q', directory)
         (directory / '.git/info/attributes').write_text('* -diff\n', encoding='ascii')
-    original_cwd = git.cwd
-    try:
-        git.cwd = directory
-        old_path.write_bytes(b'' if old == new else old)
-        new_path.write_bytes(new)
-        patch = git.run(
-            'diff',
-            '--no-index',
-            '--binary',
-            '--no-ext-diff',
-            '--no-textconv',
-            '--',
-            'old',
-            'new',
-            allowed=(0, 1),
-        )
-    finally:
-        git.cwd = original_cwd
+    old_path.write_bytes(b'' if old == new else old)
+    new_path.write_bytes(new)
+    patch = git.run(
+        '-C', directory, 'diff', '--no-index', '--binary', '--no-ext-diff',
+        '--no-textconv', '--', 'old', 'new', allowed=(0, 1),
+    )
     marker = b'GIT binary patch\n'
     if marker not in patch:
         raise PatchConversionError('Git did not produce a binary representation')
@@ -349,23 +308,14 @@ def normalize(context, patch, output, timeout=60):
             b'\n'.join(headers).decode(
                 'utf-8'
             )  # Paths and metadata must remain valid text.
-            stats = git.run('apply', '--numstat', '-z', '-', data=block)
-            fields = stats.split(b'\t', 2)
-            if (
-                len(fields) != 3
-                or fields[2].count(b'\0') != 1
-                or not fields[2].endswith(b'\0')
-            ):
-                raise PatchConversionError('Unsupported multi-path patch block')
-            path = fields[2][:-1]
+            path = _patch_path(git, block)
             old_path = new_path = path
-            for line in headers:
-                if line.startswith((b'rename from ', b'copy from ')):
-                    old_path = _unquote(line.split(b' from ', 1)[1])
-                if line.startswith(b'new file mode '):
-                    old_path = None
-                if line.startswith(b'deleted file mode '):
-                    new_path = None
+            if any(line.startswith((b'rename from ', b'copy from ')) for line in headers):
+                old_path = _patch_path(git, block, reverse=True)
+            if any(line.startswith(b'new file mode ') for line in headers):
+                old_path = None
+            if any(line.startswith(b'deleted file mode ') for line in headers):
+                new_path = None
             old_oid, old_blob = _blob(git, state['base'], old_path)
             new_oid, new_blob = _blob(git, tree, new_path)
             width = 40 if state['object_format'] == 'sha1' else 64
@@ -389,32 +339,26 @@ def normalize(context, patch, output, timeout=60):
     converted.decode('utf-8')
     git.remaining()
     output = Path(output)
-    with tempfile.NamedTemporaryFile(
-        dir=output.parent, prefix=output.name + '.', delete=False
-    ) as handle:
-        temporary = Path(handle.name)
-        try:
-            handle.write(converted)
-            handle.close()
-            os.replace(temporary, output)
-        finally:
-            temporary.unlink(missing_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent) as directory:
+        temporary = Path(directory) / 'patch'
+        temporary.touch(mode=0o600)
+        temporary.write_bytes(converted)
+        os.replace(temporary, output)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='operation', required=True)
-    initial = commands.add_parser('prepare')
-    initial.add_argument('--repo', required=True)
-    initial.add_argument('--base', required=True)
-    initial.add_argument('--context', required=True)
-    initial.add_argument('--whitespace', choices=('fix', 'nowarn'), default='fix')
-    final = commands.add_parser('normalize')
-    final.add_argument('--context', required=True)
-    final.add_argument('--patch', required=True)
-    final.add_argument('--output', required=True)
-    for command in (initial, final):
+    for operation, paths in (
+        ('prepare', ('repo', 'base', 'context')),
+        ('normalize', ('context', 'patch', 'output')),
+    ):
+        command = commands.add_parser(operation)
+        for path in paths:
+            command.add_argument('--' + path, required=True)
         command.add_argument('--timeout', type=float, default=60)
+        if operation == 'prepare':
+            command.add_argument('--whitespace', choices=('fix', 'nowarn'), default='fix')
     args = vars(parser.parse_args())
     operation = args.pop('operation')
     try:
