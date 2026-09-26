@@ -1,14 +1,14 @@
-import base64
+"""Exercise the runtime/file boundary; real Git semantics have separate tests."""
 import json
-import subprocess
+import shlex
 from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
 
-from evaluation.benchmarks.swe_bench.binary_patch_utils import remove_binary_diffs
 from evaluation.benchmarks.swe_bench.run_infer import (
     _has_existing_result,
+    _prepare_portable_patch,
     complete_runtime,
 )
 from evaluation.utils.shared import EvalException
@@ -21,7 +21,6 @@ from openhands.events.observation import (
 from openhands.runtime.base import Runtime
 
 PREFIX = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+"
-BINARY = b"diff --git a/b b/b\nBinary files a/b and b/b differ\n"
 INSTANCE = pd.Series({"repo": "example/repo", "version": "1", "base_commit": "base"})
 
 
@@ -31,26 +30,25 @@ def patch_runtime(tmp_path, monkeypatch):
         "evaluation.benchmarks.swe_bench.run_infer.DATASET_TYPE", "nv-internal-1"
     )
     runtime = MagicMock(spec=Runtime)
+    runtime._swe_patch_context = str(tmp_path / "portable")
     overrides = {}
 
     def run_action(action):
         if isinstance(action, CmdRunAction):
             assert action.command != "cat patch.diff", "Raw patch reached terminal"
-            if action.command == "base64 < patch.diff > patch.diff.base64":
-                result = subprocess.run(
-                    action.command,
-                    shell=True,
-                    cwd=tmp_path,
-                    capture_output=True,
-                    check=True,
-                    timeout=5,
-                )
-                assert result.stdout == b""
+            assert "base64" not in action.command
+            if "normalize" in shlex.split(action.command):
+                if "normalize" in overrides:
+                    return overrides["normalize"]
+                # Real normalization is qualified by helper and pipeline tests.
+                return CmdOutputObservation(content="", command=action.command, exit_code=0)
             return CmdOutputObservation(content="", command=action.command, exit_code=0)
         assert isinstance(action, FileReadAction)
-        assert action.path in ("patch.diff", "patch.diff.base64")
         if action.path in overrides:
             return overrides[action.path]
+        if action.path == getattr(runtime, '_swe_patch_context', '') + "/patch.diff":
+            return FileReadObservation(content="portable UTF-8 patch\n", path=action.path)
+        assert action.path == "patch.diff"
         try:
             content = (tmp_path / action.path).read_text(encoding="utf-8")
         except UnicodeDecodeError:
@@ -69,77 +67,73 @@ def test_utf8_patch_unchanged(patch_runtime, line):
     assert complete_runtime(runtime, INSTANCE) == {
         "git_patch": patch.decode("utf-8").rstrip("\n")
     }
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        b"\xff\x1bPsynthetic\n",
-        b"\xff\x1b[31msynthetic\n",
-        b"\xff\x1b]synthetic\n",
-        b"\xff\x85\x00\x1bP\r\n",
-        b"\xff\n\\ No newline at end of file\n",
-    ],
-)
-def test_invalid_utf8_round_trips_bytes(patch_runtime, payload):
-    runtime, patch_file, _ = patch_runtime
-    patch = PREFIX + payload
-    patch_file.write_bytes(patch)
-    result = complete_runtime(runtime, INSTANCE)
-    assert result["git_patch"] is None
-    assert base64.b64decode(result["git_patch_b64"], validate=True) == patch
-
-
-def test_excluded_final_binary_block_keeps_text_newline(patch_runtime):
-    runtime, patch_file, _ = patch_runtime
-    text_patch = PREFIX + b"\xff\r\n"
-    patch_file.write_bytes(text_patch + BINARY)
-    result = complete_runtime(runtime, INSTANCE)
-    assert base64.b64decode(result["git_patch_b64"]) == text_patch
-
-
-@pytest.mark.parametrize("patch", [b"", BINARY, BINARY + BINARY])
-def test_empty_or_binary_only_patch_is_empty(patch):
-    assert remove_binary_diffs(patch) == b""
-
-
-@pytest.mark.parametrize("content", ["%%% invalid %%%", "A", "é"])
-def test_malformed_encoded_read_is_rejected(patch_runtime, content):
-    runtime, patch_file, overrides = patch_runtime
-    patch_file.write_bytes(PREFIX + b"\xff\n")
-    overrides["patch.diff.base64"] = FileReadObservation(
-        content=content, path="patch.diff.base64"
+    assert not any(
+        isinstance(c.args[0], CmdRunAction) and "normalize" in c.args[0].command
+        for c in runtime.run_action.call_args_list
     )
-    with pytest.raises(ValueError):
+
+
+@pytest.mark.parametrize("payload", [b"\xff\x1bPsynthetic\n", b"\xff\r\n", b"\xff\n"])
+def test_invalid_utf8_uses_portable_file_and_legacy_schema(patch_runtime, payload):
+    runtime, patch_file, _ = patch_runtime
+    patch_file.write_bytes(PREFIX + payload)
+    assert complete_runtime(runtime, INSTANCE) == {"git_patch": "portable UTF-8 patch\n"}
+    calls = [c.args[0] for c in runtime.run_action.call_args_list]
+    normalization = next(c for c in calls if isinstance(c, CmdRunAction) and "normalize" in c.command)
+    assert normalization.hard_timeout == 90
+    assert shlex.split(normalization.command)[-2:] == ["--output", runtime._swe_patch_context + "/patch.diff"]
+    assert isinstance(calls[-1], FileReadAction)
+
+
+def test_missing_pre_agent_context_is_reported(patch_runtime):
+    runtime, patch_file, _ = patch_runtime
+    patch_file.write_bytes(PREFIX + b"\xff\n")
+    del runtime._swe_patch_context
+    with pytest.raises(EvalException, match="Missing pre-agent"):
         complete_runtime(runtime, INSTANCE)
 
 
-def test_encoded_file_read_error_is_reported(patch_runtime):
+def test_normalization_failure_is_not_an_empty_patch(patch_runtime):
     runtime, patch_file, overrides = patch_runtime
     patch_file.write_bytes(PREFIX + b"\xff\n")
-    overrides["patch.diff.base64"] = ErrorObservation("File not found")
-    with pytest.raises(EvalException, match="Failed to read encoded git patch"):
+    overrides["normalize"] = CmdOutputObservation(content="invalid patch", command="normalize", exit_code=1)
+    with pytest.raises(EvalException, match="Failed to make UTF-8 Git patch"):
+        complete_runtime(runtime, INSTANCE)
+
+
+def test_portable_file_read_error_is_reported(patch_runtime):
+    runtime, patch_file, overrides = patch_runtime
+    patch_file.write_bytes(PREFIX + b"\xff\n")
+    overrides[runtime._swe_patch_context + "/patch.diff"] = ErrorObservation("File not found")
+    with pytest.raises(EvalException, match="Failed to read portable git patch"):
         complete_runtime(runtime, INSTANCE)
 
 
 def test_other_read_error_does_not_start_recovery(patch_runtime):
     runtime, _, overrides = patch_runtime
     overrides["patch.diff"] = ErrorObservation("File not found")
-    with pytest.raises(AssertionError):
+    with pytest.raises(EvalException, match="Failed to read git patch"):
         complete_runtime(runtime, INSTANCE)
     assert isinstance(runtime.run_action.call_args.args[0], FileReadAction)
 
 
-def test_saved_byte_patch_is_recognized(tmp_path):
+@pytest.mark.parametrize("dataset,policy", [("R2E-Gym", "fix"), ("SWE-bench", "nowarn")])
+def test_preparation_copies_helper_and_captures_policy(patch_runtime, monkeypatch, dataset, policy):
+    runtime, _, _ = patch_runtime
+    monkeypatch.setattr("evaluation.benchmarks.swe_bench.run_infer.DATASET_TYPE", dataset)
+    _prepare_portable_patch(runtime, INSTANCE)
+    runtime.copy_to.assert_called_once()
+    assert runtime.copy_to.call_args.args[0].endswith("/portable_patch.py")
+    command = shlex.split(runtime.run_action.call_args.args[0].command)
+    assert command[-2:] == ["--whitespace", policy]
+    assert command[command.index("--base") + 1] == "base"
+    assert runtime._swe_patch_context.startswith("/tmp/openhands-patch-")
+
+
+def test_saved_portable_patch_is_recognized(tmp_path):
     completions = tmp_path / "llm_completions" / "example"
     completions.mkdir(parents=True)
     (completions / "completion.json").write_text("{}")
-    result = {
-        "instance_id": "example",
-        "test_result": {
-            "git_patch": None,
-            "git_patch_b64": base64.b64encode(PREFIX + b"\xff\n").decode(),
-        },
-    }
+    result = {"instance_id": "example", "test_result": {"git_patch": "GIT binary patch\nliteral 1\n"}}
     (tmp_path / "output.jsonl").write_text(json.dumps(result) + "\n")
     assert _has_existing_result(str(tmp_path), "example") == (True, result)

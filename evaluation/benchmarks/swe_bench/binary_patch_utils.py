@@ -5,26 +5,23 @@ def remove_binary_diffs(patch_text):
     """Remove binary file diffs from a git patch.
 
     Args:
-        patch_text (str | bytes): The git patch text or undecoded patch bytes
+        patch_text (str): The git patch text
 
     Returns:
-        str | bytes: The patch with binary diffs removed, preserving its type
+        str: The cleaned patch text with binary diffs removed
     """
-    raw = isinstance(patch_text, bytes)
-    lines = patch_text.split(b'\n') if raw else patch_text.splitlines()
-    if raw:
-        lines[:-1] = [line + b'\n' for line in lines[:-1]]
+    lines = patch_text.splitlines()
     cleaned_lines = []
     block = []
     is_binary_block = False
 
     for line in lines:
-        if line.startswith(b'diff --git ' if raw else 'diff --git '):
+        if line.startswith('diff --git '):
             if block and not is_binary_block:
                 cleaned_lines.extend(block)
             block = [line]
             is_binary_block = False
-        elif (b'Binary files' if raw else 'Binary files') in line:
+        elif 'Binary files' in line:
             is_binary_block = True
             block.append(line)
         else:
@@ -32,7 +29,7 @@ def remove_binary_diffs(patch_text):
 
     if block and not is_binary_block:
         cleaned_lines.extend(block)
-    return (b'' if raw else '\n').join(cleaned_lines)
+    return '\n'.join(cleaned_lines)
 
 
 def remove_binary_files_from_git():

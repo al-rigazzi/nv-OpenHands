@@ -1,10 +1,11 @@
 import asyncio
-import base64
 import copy
 import json
 import os
+import shlex
 import shutil
 import tempfile
+import uuid
 from typing import Any, Dict, Literal, Optional
 import time
 import pandas as pd
@@ -394,6 +395,37 @@ def get_config(
     return config
 
 
+def _prepare_portable_patch(runtime: Runtime, instance):
+    """Capture patch-application policy before agent edits, inside its sandbox."""
+    directory = f'/tmp/openhands-patch-{uuid.uuid4().hex}'
+    action = CmdRunAction(command=f'mkdir -m 700 {shlex.quote(directory)}')
+    action.set_hard_timeout(60)
+    obs = runtime.run_action(action)
+    assert_and_raise(
+        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+        f'Failed to create portable patch directory: {obs}',
+    )
+    runtime.copy_to(
+        os.path.join(os.path.dirname(__file__), 'portable_patch.py'), directory + '/'
+    )
+    workspace = _get_workspace_path(instance, _get_swebench_workspace_dir_name(instance))
+    # R2E fixes whitespace on application; the built-in SWE evaluator does not.
+    whitespace = 'fix' if DATASET_TYPE == 'R2E-Gym' else 'nowarn'
+    command = shlex.join([
+        'python', directory + '/portable_patch.py', 'prepare', '--repo', workspace,
+        '--base', instance['base_commit'], '--context', directory + '/state',
+        '--whitespace', whitespace,
+    ])
+    action = CmdRunAction(command=command)
+    action.set_hard_timeout(90)
+    obs = runtime.run_action(action)
+    assert_and_raise(
+        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+        f'Failed to capture portable patch context: {obs}',
+    )
+    runtime._swe_patch_context = directory
+
+
 def initialize_runtime(
     runtime: Runtime,
     instance: pd.Series,  # this argument is not required
@@ -593,6 +625,15 @@ source ~/.bashrc
             f'Expected to find python interpreter from testbed, but got: {str(obs)}',
         )
 
+    runtime._swe_patch_context = None
+    if DATASET_TYPE != 'SWE-bench-Live':
+        try:
+            _prepare_portable_patch(runtime, instance)
+        except Exception as exc:
+            # Keep the existing UTF-8 path usable on unsupported Git/checkouts.
+            # An undecodable result still fails explicitly without this context.
+            logger.warning('Non-UTF-8 patch recovery unavailable: %s', ascii(str(exc)))
+
     logger.info('-' * 30)
     logger.info('END Runtime Initialization Fn')
     logger.info('-' * 30)
@@ -748,6 +789,7 @@ def complete_runtime(
 
     n_retries = 0
     git_patch = None
+    portable = False
     while n_retries < 5:
         action = CmdRunAction(
             command=f'git diff --no-color --cached {instance["base_commit"]} > patch.diff'
@@ -769,26 +811,42 @@ def complete_runtime(
                     git_patch = obs.content
                     break
                 elif isinstance(obs, ErrorObservation):
-                    # Keep undecodable patch bytes out of the interactive terminal.
-                    assert 'File could not be decoded as utf-8' in obs.content
-                    action = CmdRunAction(
-                        command='base64 < patch.diff > patch.diff.base64'
+                    assert_and_raise(
+                        'File could not be decoded as utf-8' in obs.content,
+                        f'Failed to read git patch: {obs}',
                     )
-                    action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+                    # Convert only undecodable file diffs to standard Git binary
+                    # hunks. Both raw input and portable output stay off the PTY.
+                    directory = getattr(runtime, '_swe_patch_context', None)
+                    assert_and_raise(
+                        isinstance(directory, str),
+                        'Missing pre-agent portable patch context',
+                    )
+                    portable_path = directory + '/patch.diff'
+                    action = CmdRunAction(command=shlex.join([
+                        'python', directory + '/portable_patch.py', 'normalize',
+                        '--context', directory + '/state', '--patch', 'patch.diff',
+                        '--output', portable_path,
+                    ]))
+                    action.set_hard_timeout(90)
                     logger.info(action, extra={'msg_type': 'ACTION'})
                     obs = runtime.run_action(action)
-                    assert isinstance(obs, CmdOutputObservation) and obs.exit_code == 0
+                    assert_and_raise(
+                        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+                        f'Failed to make UTF-8 Git patch: {obs}',
+                    )
                     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
-                    action = FileReadAction(path='patch.diff.base64')
-                    action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+                    action = FileReadAction(path=portable_path)
+                    action.set_hard_timeout(90)
                     obs = runtime.run_action(action)
                     assert_and_raise(
                         isinstance(obs, FileReadObservation),
-                        f'Failed to read encoded git patch: {obs}',
+                        f'Failed to read portable git patch: {obs}',
                     )
-                    git_patch = base64.b64decode(
-                        obs.content.replace('\n', ''), validate=True
-                    )
+                    # Already filtered on raw bytes; do not run the legacy text
+                    # filter again, which can alter embedded CR/control bytes.
+                    git_patch = obs.content
+                    portable = True
                     break
                 else:
                     assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
@@ -804,16 +862,12 @@ def complete_runtime(
     assert_and_raise(git_patch is not None, 'Failed to get git diff (None)')
 
     # Remove binary diffs from the patch
-    git_patch = remove_binary_diffs(git_patch)
+    if not portable:
+        git_patch = remove_binary_diffs(git_patch)
 
     logger.info('-' * 30)
     logger.info('END Runtime Completion Fn')
     logger.info('-' * 30)
-    if isinstance(git_patch, bytes):
-        return {
-            'git_patch': None,
-            'git_patch_b64': base64.b64encode(git_patch).decode('ascii'),
-        }
     return {'git_patch': git_patch}
 
 
@@ -836,10 +890,7 @@ def _has_existing_result(eval_output_dir: str, instance_id: str) -> tuple[bool, 
                     try:
                         result = json.loads(line.strip())
                         if result.get('instance_id') == instance_id:
-                            test_result = result.get('test_result', {})
-                            git_patch = test_result.get('git_patch') or test_result.get(
-                                'git_patch_b64'
-                            )
+                            git_patch = result.get('test_result', {}).get('git_patch', '')
                             if git_patch and git_patch.strip():
                                 existing_result = result
                                 break
@@ -990,7 +1041,7 @@ def process_instance(
         else:
             complete_runtime_fn = complete_runtime
         return_val = complete_runtime_fn(runtime, instance)
-        git_patch = return_val.get('git_patch_b64', return_val['git_patch'])
+        git_patch = return_val['git_patch']
         logger.info(
             f'Got git diff for instance {instance.instance_id}:\n--------\n{git_patch}\n--------'
         )
@@ -1002,7 +1053,9 @@ def process_instance(
     # ======= Attempt to evaluate the agent's edits =======
     # we use eval_infer.sh to evaluate the agent's edits, not here
     # because the agent may alter the environment / testcases
-    test_result = return_val
+    test_result = {
+        'git_patch': git_patch,
+    }
 
     # If you are working on some simpler benchmark that only evaluates the final model output (e.g., in a MessageAction)
     # You can simply get the LAST `MessageAction` from the returned `state.history` and parse it for evaluation.
