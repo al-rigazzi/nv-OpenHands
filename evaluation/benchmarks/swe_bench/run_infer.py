@@ -412,9 +412,8 @@ def _prepare_portable_patch(runtime: Runtime, instance):
     # R2E fixes whitespace on application; the built-in SWE evaluator does not.
     whitespace = 'fix' if DATASET_TYPE == 'R2E-Gym' else 'nowarn'
     command = shlex.join([
-        'python', directory + '/portable_patch.py', 'prepare', '--repo', workspace,
-        '--base', instance['base_commit'], '--context', directory + '/state',
-        '--whitespace', whitespace, '--timeout', '600',
+        'python', directory + '/portable_patch.py', 'prepare', workspace,
+        instance['base_commit'], directory + '/state', whitespace, '600',
     ])
     action = CmdRunAction(command=command)
     action.set_hard_timeout(600)
@@ -828,8 +827,7 @@ def complete_runtime(
                     timeout = max(300 + 100 * n_retries, 600)
                     action = CmdRunAction(command=shlex.join([
                         'python', directory + '/portable_patch.py', 'normalize',
-                        '--context', directory + '/state', '--patch', 'patch.diff',
-                        '--output', portable_path, '--timeout', str(timeout),
+                        directory + '/state', 'patch.diff', portable_path, str(timeout),
                     ]))
                     action.set_hard_timeout(timeout)
                     logger.info(action, extra={'msg_type': 'ACTION'})

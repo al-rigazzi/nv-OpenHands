@@ -82,8 +82,11 @@ def test_invalid_utf8_uses_portable_file_and_legacy_schema(patch_runtime, payloa
     normalization = next(c for c in calls if isinstance(c, CmdRunAction) and "normalize" in c.command)
     assert normalization.hard_timeout == 600
     command = shlex.split(normalization.command)
-    assert command[command.index("--output") + 1] == runtime._swe_patch_context + "/patch.diff"
-    assert command[command.index("--timeout") + 1] == "600"
+    directory = runtime._swe_patch_context
+    assert command == [
+        "python", directory + "/portable_patch.py", "normalize",
+        directory + "/state", "patch.diff", directory + "/patch.diff", "600",
+    ]
     assert isinstance(calls[-1], FileReadAction)
     assert calls[-1].hard_timeout == 600
 
@@ -123,7 +126,12 @@ def test_extraction_preserves_original_retry_timeouts(
         normalization = next(call for call in calls if isinstance(call, CmdRunAction) and "normalize" in shlex.split(call.command))
         command = shlex.split(normalization.command)
         assert normalization.hard_timeout == expected
-        assert float(command[command.index("--timeout") + 1]) == expected
+        directory = runtime._swe_patch_context
+        assert command == [
+            "python", directory + "/portable_patch.py", "normalize",
+            directory + "/state", "patch.diff", directory + "/patch.diff",
+            str(expected),
+        ]
 
 
 def test_missing_pre_agent_context_is_reported(patch_runtime):
@@ -167,10 +175,13 @@ def test_preparation_copies_helper_and_captures_policy(patch_runtime, monkeypatc
     assert runtime.copy_to.call_args.args[0].endswith("/portable_patch.py")
     preparation = runtime.run_action.call_args.args[0]
     command = shlex.split(preparation.command)
-    assert command[command.index("--whitespace") + 1] == policy
+    directory = runtime._swe_patch_context
+    workspace = "/testbed" if dataset == "R2E-Gym" else "/workspace/example__repo__1"
+    assert command == [
+        "python", directory + "/portable_patch.py", "prepare", workspace,
+        "base", directory + "/state", policy, "600",
+    ]
     assert preparation.hard_timeout == 600
-    assert command[command.index("--timeout") + 1] == "600"
-    assert command[command.index("--base") + 1] == "base"
     assert runtime._swe_patch_context.startswith("/tmp/openhands-patch-")
 
 

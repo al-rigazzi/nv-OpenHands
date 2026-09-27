@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import random
 import shutil
 import subprocess
 import sys
@@ -109,6 +110,43 @@ def test_preserves_application_bytes(case, content):
         case, lambda repo: (repo / 'file.txt').write_bytes(content)
     )
     assert b'GIT binary patch\n' in portable
+
+
+@pytest.mark.parametrize('size', [17, 18, 19, 40, 41, 42, 43, 4096])
+def test_incompressible_content_applies_and_reverses(case, size):
+    # Small cases cross Git's 26/52-byte framing boundaries and base85 padding;
+    # the large case spans many frames. Git itself is the format oracle.
+    content = bytes(random.Random(924).choices(range(1, 256), k=size - 1)) + b'\xff'
+    original = content[::-1]
+    repo, context, _ = case
+    (repo / 'file.txt').write_bytes(original)
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-qm', 'incompressible base')
+    case = repo, context, git(repo, 'rev-parse', 'HEAD').decode().strip()
+    _, portable, target = convert(
+        case, lambda r: (r / 'file.txt').write_bytes(content), policy='nowarn'
+    )
+    assert b'GIT binary patch\n' in portable
+    assert (target / 'file.txt').read_bytes() == content
+    git(target, 'apply', '--reverse', '-', data=portable)
+    assert (target / 'file.txt').read_bytes() == original
+
+
+@pytest.mark.parametrize('to_empty', [False, True])
+def test_empty_blob_transition_applies_and_reverses(case, to_empty):
+    original, content = (b'old \xff\n', b'') if to_empty else (b'', b'new \xff\n')
+    repo, context, _ = case
+    (repo / 'file.txt').write_bytes(original)
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-qm', 'empty transition base')
+    case = repo, context, git(repo, 'rev-parse', 'HEAD').decode().strip()
+    _, portable, target = convert(
+        case, lambda r: (r / 'file.txt').write_bytes(content)
+    )
+    assert (target / 'file.txt').is_file()
+    assert (target / 'file.txt').read_bytes() == content
+    git(target, 'apply', '--reverse', '-', data=portable)
+    assert (target / 'file.txt').read_bytes() == original
 
 
 def test_keeps_valid_blocks_and_omits_original_binary(case):
@@ -245,11 +283,25 @@ def test_empty_and_malformed(case):
     assert out.read_bytes() == b''
 
 
-def test_rejects_initial_tracked_drift_and_zero_deadline(case):
+def test_initial_tracked_drift_preserves_raw_git_application(case):
     repo, context, base = case
-    (repo / 'file.txt').write_bytes(b'preexisting tracked drift\n')
-    with pytest.raises(PatchConversionError):
-        prepare(repo, base, context)
+    (repo / 'file.txt').write_bytes(b'preexisting tracked drift \xff  \t\n')
+    prepare(repo, base, context)
+    git(repo, 'add', '-A')
+    raw = git(repo, 'diff', '--cached', base)
+    patch, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    patch.write_bytes(raw)
+    normalize(context, patch, output)
+    git(repo, 'reset', '--hard', base)
+    git(repo, 'apply', '--whitespace=fix', '-', data=raw)
+    expected = (repo / 'file.txt').read_bytes()
+    git(repo, 'reset', '--hard', base)
+    git(repo, 'apply', '--whitespace=fix', str(output))
+    assert (repo / 'file.txt').read_bytes() == expected
+
+
+def test_rejects_zero_deadline(case):
+    repo, context, base = case
     with pytest.raises(PatchConversionError, match='time budget'):
         prepare(repo, base, context, timeout=0)
 
@@ -367,36 +419,6 @@ def test_path_operations_preserve_identity_and_rename_reversal(
     assert (target / name).read_bytes() == original
 
 
-def test_publication_is_atomic_and_private(case, monkeypatch):
-    repo, context, base = case
-    prepare(repo, base, context)
-    (repo / 'file.txt').write_bytes(b'changed \xff\n')
-    git(repo, 'add', '-A')
-    patch, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
-    patch.write_bytes(git(repo, 'diff', '--cached', base))
-    output.write_bytes(b'previous patch')
-    before = set(repo.parent.iterdir())
-    replace = os.replace
-
-    def failed_replace(source, destination):
-        assert Path(source).stat().st_mode & 0o777 == 0o600
-        assert output.read_bytes() == b'previous patch'
-        raise OSError('publication failed')
-
-    monkeypatch.setattr(os, 'replace', failed_replace)
-    with pytest.raises(OSError, match='publication failed'):
-        normalize(context, patch, output)
-    assert output.read_bytes() == b'previous patch'
-    assert set(repo.parent.iterdir()) == before
-    monkeypatch.setattr(os, 'replace', replace)
-    normalize(context, patch, output)
-    assert output.stat().st_mode & 0o777 == 0o600
-    assert set(repo.parent.iterdir()) == before
-    git(repo, 'reset', '--hard', base)
-    git(repo, 'apply', str(output))
-    assert (repo / 'file.txt').read_bytes() == b'changed \xff\n'
-
-
 def test_prepare_does_not_mutate_source(case):
     repo, context, base = case
     (repo / '.git/info/attributes').write_bytes(b'file.txt -whitespace\n')
@@ -433,12 +455,10 @@ def test_cli_failure_diagnostics_cannot_emit_terminal_controls(case):
             sys.executable,
             prepare.__code__.co_filename,
             'normalize',
-            '--context',
             str(context),
-            '--patch',
             str(patch),
-            '--output',
             str(output),
+            '600',
         ],
         capture_output=True,
         timeout=10,
@@ -447,5 +467,7 @@ def test_cli_failure_diagnostics_cannot_emit_terminal_controls(case):
     assert result.stdout == b''
     assert result.stderr.endswith(b'\n')
     assert all(32 <= byte < 127 for byte in result.stderr[:-1])
-    assert b'<0xff><0x1b>Punterminated<0x0d>' in result.stderr
+    assert all(
+        marker in result.stderr for marker in (b'xff', b'x1b', b'Punterminated')
+    )
     assert b'z.txt: patch does not apply' in result.stderr

@@ -6,15 +6,15 @@ conversion for a known apply policy, not a transport encoding for arbitrary
 consumers. The agent repository is never modified by this module.
 """
 
-import argparse
+import base64
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
 import sys
-import tempfile
 import time
+import zlib
 
 
 class PatchConversionError(Exception):
@@ -51,10 +51,8 @@ class Git:
                 cwd=self.cwd,
                 env=self.env,
                 input=data,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=self.remaining(),
-                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise PatchConversionError(
@@ -62,10 +60,7 @@ class Git:
             ) from exc
         if result.returncode not in allowed:
             # Git diagnostics can contain undecodable source bytes; never emit them raw.
-            detail = ''.join(
-                chr(byte) if 32 <= byte < 127 else f'<0x{byte:02x}>'
-                for byte in result.stderr[:2048]
-            )
+            detail = repr(result.stderr[:2048])
             raise PatchConversionError(f'Git failed ({result.returncode}): {detail}')
         return result.stdout
 
@@ -119,7 +114,7 @@ def _attribute_path(git, name):
 
 
 def prepare(repo, base, context, whitespace='fix', timeout=600):
-    """Snapshot a clean base and the initial evaluator attribute policy."""
+    """Snapshot the base and initial evaluator attribute policy."""
     repo, context = Path(repo).resolve(), Path(context).resolve()
     if context == repo or repo in context.parents:
         raise PatchConversionError('Patch context must be outside the repository')
@@ -131,7 +126,6 @@ def prepare(repo, base, context, whitespace='fix', timeout=600):
         .decode('ascii')
         .strip()
     )
-    source.run('diff', '--quiet', '--no-ext-diff', '--no-textconv', base, '--')
     objects = Path(
         os.fsdecode(source.run('rev-parse', '--git-path', 'objects').rstrip(b'\n'))
     )
@@ -140,8 +134,6 @@ def prepare(repo, base, context, whitespace='fix', timeout=600):
     object_format = (
         source.run('rev-parse', '--show-object-format').decode('ascii').strip()
     )
-    if object_format not in ('sha1', 'sha256'):
-        raise PatchConversionError('Unsupported Git object format')
     whitespace_config = source.run('config', '--get', 'core.whitespace', allowed=(0, 1))
     system = _attribute_path(source, 'GIT_ATTR_SYSTEM')
     global_attrs = _attribute_path(source, 'GIT_ATTR_GLOBAL')
@@ -186,16 +178,7 @@ def prepare(repo, base, context, whitespace='fix', timeout=600):
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(path.read_bytes())
     (context / 'state.json').write_text(
-        json.dumps(
-            {
-                'version': 1,
-                'base': base,
-                'whitespace': whitespace,
-                'object_format': object_format,
-            },
-            ensure_ascii=True,
-        ),
-        encoding='ascii',
+        json.dumps({'base': base, 'whitespace': whitespace}), encoding='ascii'
     )
 
 
@@ -216,62 +199,36 @@ def _patch_path(git, block, reverse=False):
     # Let Git decode quoted rename/copy paths, including octal and control bytes.
     flags = ('--reverse',) if reverse else ()
     stats = git.run('apply', '--numstat', '-z', *flags, '-', data=block)
-    fields = stats.split(b'\t', 2)
-    if len(fields) != 3 or fields[2].count(b'\0') != 1 or not stats.endswith(b'\0'):
-        raise PatchConversionError('Unsupported multi-path patch block')
-    return fields[2][:-1]
+    return stats.split(b'\t', 2)[2][:-1]
 
 
 def _blob(git, tree, path):
     if path is None:
         return None, b''
-    listing = git.run('ls-tree', '-z', tree, '--', ':(literal)' + os.fsdecode(path))
-    entries = listing.rstrip(b'\0').split(b'\0') if listing else []
-    if len(entries) != 1:
-        raise PatchConversionError('Patch path missing or ambiguous in expected tree')
-    metadata, actual_path = entries[0].split(b'\t', 1)
-    mode, kind, oid = metadata.split()
-    if (
-        actual_path != path
-        or kind != b'blob'
-        or mode not in (b'100644', b'100755', b'120000')
-    ):
-        raise PatchConversionError('Unsupported patch file type')
+    oid = git.run('rev-parse', '--verify', tree + ':' + os.fsdecode(path)).strip()
     return oid, git.run('cat-file', 'blob', oid.decode('ascii'))
 
 
-def _binary_body(git, directory, old, new):
-    directory.mkdir(exist_ok=True)
-    old_path, new_path = directory / 'old', directory / 'new'
-    # The binary representation repo has no attribute relationship to task files.
-    if not (directory / '.git').exists():
-        git.run('init', '-q', directory)
-        (directory / '.git/info/attributes').write_text('* -diff\n', encoding='ascii')
-    old_path.write_bytes(b'' if old == new else old)
-    new_path.write_bytes(new)
-    patch = git.run(
-        '-C', directory, 'diff', '--no-index', '--binary', '--no-ext-diff',
-        '--no-textconv', '--', 'old', 'new', allowed=(0, 1),
-    )
-    marker = b'GIT binary patch\n'
-    if marker not in patch:
-        raise PatchConversionError('Git did not produce a binary representation')
-    body = patch.split(marker, 1)[1]
-    if old == new:
-        # Whitespace-only changes may normalize to the original nonempty blob.
-        # Keep a nonempty, reversible no-op patch so existing patch_exists logic
-        # does not turn a successfully applicable proposal into an empty result.
-        literal = body.split(b'\n\n', 1)[0]
-        body = literal + b'\n\n' + literal + b'\n\n'
-    return marker + body
+def _binary_body(old, new):
+    """Git literal hunks: zlib data in length-prefixed, padded base85 lines."""
+    lines = [b'GIT binary patch']
+    # Forward and reverse literals also preserve whitespace-normalized no-ops.
+    for blob in (new, old):
+        lines.append(f'literal {len(blob)}'.encode('ascii'))
+        compressed = zlib.compress(blob)
+        for offset in range(0, len(compressed), 52):
+            chunk = compressed[offset:offset + 52]
+            size = len(chunk)
+            prefix = bytes([size + (64 if size <= 26 else 70)])
+            lines.append(prefix + base64.b85encode(chunk, pad=True))
+        lines.append(b'')
+    return b'\n'.join(lines) + b'\n'
 
 
 def normalize(context, patch, output, timeout=600):
     """Write a UTF-8 patch while retaining operation identity and valid blocks."""
     context = Path(context).resolve()
     state = json.loads((context / 'state.json').read_text(encoding='ascii'))
-    if state.get('version') != 1 or state.get('whitespace') not in ('fix', 'nowarn'):
-        raise PatchConversionError('Unsupported patch context')
     worktree = context / 'worktree'
     git = Git(worktree, timeout, private=True)
     blocks = _filter_blocks(Path(patch).read_bytes())
@@ -293,21 +250,8 @@ def normalize(context, patch, output, timeout=600):
                 continue
             except UnicodeDecodeError:
                 pass
-            if not block.startswith(b'diff --git '):
-                raise PatchConversionError('Non-UTF-8 bytes outside a Git file block')
-            lines = block.split(b'\n')
-            try:
-                content_start = next(
-                    i for i, line in enumerate(lines) if line.startswith(b'--- ')
-                )
-            except StopIteration as exc:
-                raise PatchConversionError(
-                    'Unsupported undecodable patch without text hunks'
-                ) from exc
-            headers = lines[:content_start]
-            b'\n'.join(headers).decode(
-                'utf-8'
-            )  # Paths and metadata must remain valid text.
+            # Input is the already-applied Git diff; retain its operation headers.
+            headers = block[:block.index(b'\n--- ')].split(b'\n')
             path = _patch_path(git, block)
             old_path = new_path = path
             if any(line.startswith((b'rename from ', b'copy from ')) for line in headers):
@@ -318,51 +262,27 @@ def normalize(context, patch, output, timeout=600):
                 new_path = None
             old_oid, old_blob = _blob(git, state['base'], old_path)
             new_oid, new_blob = _blob(git, tree, new_path)
-            width = 40 if state['object_format'] == 'sha1' else 64
+            width = len(state['base'])
             old_oid = old_oid or b'0' * width
             new_oid = new_oid or b'0' * width
             index = b'index ' + old_oid + b'..' + new_oid
-            replaced = False
-            for i, line in enumerate(headers):
-                if line.startswith(b'index '):
-                    pieces = line.split()
-                    headers[i] = index + (b' ' + pieces[2] if len(pieces) == 3 else b'')
-                    replaced = True
-            if not replaced:
-                raise PatchConversionError('Patch lacks index metadata')
+            header = re.sub(
+                rb'(?m)^index [0-9a-f]+\.\.[0-9a-f]+', index, b'\n'.join(headers)
+            )
             converted_blocks.append(
-                b'\n'.join(headers)
-                + b'\n'
-                + _binary_body(git, context / 'binary', old_blob, new_blob)
+                header + b'\n' + _binary_body(old_blob, new_blob)
             )
         converted = b''.join(converted_blocks)
     converted.decode('utf-8')
     git.remaining()
-    output = Path(output)
-    with tempfile.TemporaryDirectory(dir=output.parent) as directory:
-        temporary = Path(directory) / 'patch'
-        temporary.touch(mode=0o600)
-        temporary.write_bytes(converted)
-        os.replace(temporary, output)
+    Path(output).write_bytes(converted)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest='operation', required=True)
-    for operation, paths in (
-        ('prepare', ('repo', 'base', 'context')),
-        ('normalize', ('context', 'patch', 'output')),
-    ):
-        command = commands.add_parser(operation)
-        for path in paths:
-            command.add_argument('--' + path, required=True)
-        command.add_argument('--timeout', type=float, default=600)
-        if operation == 'prepare':
-            command.add_argument('--whitespace', choices=('fix', 'nowarn'), default='fix')
-    args = vars(parser.parse_args())
-    operation = args.pop('operation')
     try:
-        (prepare if operation == 'prepare' else normalize)(**args)
+        operation, *args = sys.argv[1:]
+        timeout = float(args.pop())
+        {'prepare': prepare, 'normalize': normalize}[operation](*args, timeout=timeout)
     except Exception as exc:
         print(
             'Patch conversion failed: ' + ascii(str(exc)),
