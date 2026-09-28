@@ -8,7 +8,6 @@ import pytest
 
 from evaluation.benchmarks.swe_bench.run_infer import (
     _has_existing_result,
-    _prepare_portable_patch,
     complete_runtime,
 )
 from evaluation.utils.shared import EvalException
@@ -21,6 +20,7 @@ from openhands.events.observation import (
 from openhands.runtime.base import Runtime
 
 PREFIX = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+"
+PORTABLE = "/tmp/openhands-patch-test"
 INSTANCE = pd.Series({"repo": "example/repo", "version": "1", "base_commit": "base"})
 
 
@@ -30,23 +30,26 @@ def patch_runtime(tmp_path, monkeypatch):
         "evaluation.benchmarks.swe_bench.run_infer.DATASET_TYPE", "nv-internal-1"
     )
     runtime = MagicMock(spec=Runtime)
-    runtime._swe_patch_context = str(tmp_path / "portable")
+    monkeypatch.setattr(
+        "evaluation.benchmarks.swe_bench.run_infer.uuid.uuid4",
+        lambda: MagicMock(hex="test"),
+    )
     overrides = {}
 
     def run_action(action):
         if isinstance(action, CmdRunAction):
             assert action.command != "cat patch.diff", "Raw patch reached terminal"
             assert "base64" not in action.command
-            if "normalize" in shlex.split(action.command):
-                if "normalize" in overrides:
-                    return overrides["normalize"]
-                # Real normalization is qualified by helper and pipeline tests.
+            if "/portable_patch.py" in action.command:
+                if "convert" in overrides:
+                    return overrides["convert"]
+                # Real conversion is qualified by helper and pipeline tests.
                 return CmdOutputObservation(content="", command=action.command, exit_code=0)
             return CmdOutputObservation(content="", command=action.command, exit_code=0)
         assert isinstance(action, FileReadAction)
         if action.path in overrides:
             return overrides[action.path]
-        if action.path == getattr(runtime, '_swe_patch_context', '') + "/patch.diff":
+        if action.path == PORTABLE + "/patch.diff":
             return FileReadObservation(content="portable UTF-8 patch\n", path=action.path)
         assert action.path == "patch.diff"
         try:
@@ -71,7 +74,7 @@ def test_utf8_patch_unchanged(patch_runtime, line):
         "git_patch": "\n".join(patch.decode("utf-8").splitlines())
     }
     assert not any(
-        isinstance(c.args[0], CmdRunAction) and "normalize" in c.args[0].command
+        isinstance(c.args[0], CmdRunAction) and "/portable_patch.py" in c.args[0].command
         for c in runtime.run_action.call_args_list
     )
 
@@ -86,7 +89,7 @@ def test_utf8_binary_notice_keeps_original_filter(patch_runtime):
     )
     assert complete_runtime(runtime, INSTANCE) == {"git_patch": text.rstrip("\n")}
     assert not any(
-        isinstance(c.args[0], CmdRunAction) and "normalize" in c.args[0].command
+        isinstance(c.args[0], CmdRunAction) and "/portable_patch.py" in c.args[0].command
         for c in runtime.run_action.call_args_list
     )
 
@@ -97,13 +100,12 @@ def test_invalid_utf8_uses_portable_file_and_legacy_schema(patch_runtime, payloa
     patch_file.write_bytes(PREFIX + payload)
     assert complete_runtime(runtime, INSTANCE) == {"git_patch": "portable UTF-8 patch"}
     calls = [c.args[0] for c in runtime.run_action.call_args_list]
-    normalization = next(c for c in calls if isinstance(c, CmdRunAction) and "normalize" in c.command)
+    normalization = next(c for c in calls if isinstance(c, CmdRunAction) and "/portable_patch.py" in c.command)
     assert normalization.hard_timeout == 600
     command = shlex.split(normalization.command)
-    directory = runtime._swe_patch_context
+    directory = PORTABLE
     assert command == [
-        "python", directory + "/portable_patch.py", "normalize",
-        directory + "/state", "patch.diff", directory + "/patch.diff", "600",
+        "python", directory + "/portable_patch.py", ".", "patch.diff", directory + "/patch.diff", "600",
     ]
     assert isinstance(calls[-1], FileReadAction)
     assert calls[-1].hard_timeout == 600
@@ -141,29 +143,41 @@ def test_extraction_preserves_original_retry_timeouts(
     reads = [call for call in calls if isinstance(call, FileReadAction)]
     assert [call.hard_timeout for call in reads] == [expected] * (2 if portable else 1)
     if portable:
-        normalization = next(call for call in calls if isinstance(call, CmdRunAction) and "normalize" in shlex.split(call.command))
+        normalization = next(call for call in calls if isinstance(call, CmdRunAction) and "/portable_patch.py" in call.command)
         command = shlex.split(normalization.command)
         assert normalization.hard_timeout == expected
-        directory = runtime._swe_patch_context
+        directory = PORTABLE
         assert command == [
-            "python", directory + "/portable_patch.py", "normalize",
-            directory + "/state", "patch.diff", directory + "/patch.diff",
+            "python", directory + "/portable_patch.py", ".", "patch.diff", directory + "/patch.diff",
             str(expected),
         ]
 
 
-def test_missing_pre_agent_context_is_reported(patch_runtime):
+def test_helper_is_copied_only_when_needed(patch_runtime):
+    runtime, patch_file, _ = patch_runtime
+    patch_file.write_bytes(PREFIX + b"text\n")
+    complete_runtime(runtime, INSTANCE)
+    runtime.copy_to.assert_not_called()
+    patch_file.write_bytes(PREFIX + b"\xff\n")
+    complete_runtime(runtime, INSTANCE)
+    runtime.copy_to.assert_called_once()
+    source, destination = runtime.copy_to.call_args.args
+    assert source.endswith("/portable_patch.py")
+    assert destination == PORTABLE + "/"
+
+
+def test_helper_copy_failure_is_reported(patch_runtime):
     runtime, patch_file, _ = patch_runtime
     patch_file.write_bytes(PREFIX + b"\xff\n")
-    del runtime._swe_patch_context
-    with pytest.raises(EvalException, match="Missing pre-agent"):
+    runtime.copy_to.side_effect = RuntimeError("upload failed")
+    with pytest.raises(RuntimeError, match="upload failed"):
         complete_runtime(runtime, INSTANCE)
 
 
-def test_normalization_failure_is_not_an_empty_patch(patch_runtime):
+def test_conversion_failure_is_not_an_empty_patch(patch_runtime):
     runtime, patch_file, overrides = patch_runtime
     patch_file.write_bytes(PREFIX + b"\xff\n")
-    overrides["normalize"] = CmdOutputObservation(content="invalid patch", command="normalize", exit_code=1)
+    overrides["convert"] = CmdOutputObservation(content="invalid patch", command="convert", exit_code=1)
     with pytest.raises(EvalException, match="Failed to make UTF-8 Git patch"):
         complete_runtime(runtime, INSTANCE)
 
@@ -171,7 +185,7 @@ def test_normalization_failure_is_not_an_empty_patch(patch_runtime):
 def test_portable_file_read_error_is_reported(patch_runtime):
     runtime, patch_file, overrides = patch_runtime
     patch_file.write_bytes(PREFIX + b"\xff\n")
-    overrides[runtime._swe_patch_context + "/patch.diff"] = ErrorObservation("File not found")
+    overrides[PORTABLE + "/patch.diff"] = ErrorObservation("File not found")
     with pytest.raises(EvalException, match="Failed to read portable git patch"):
         complete_runtime(runtime, INSTANCE)
 
@@ -182,25 +196,6 @@ def test_other_read_error_does_not_start_recovery(patch_runtime):
     with pytest.raises(EvalException, match="Failed to read git patch"):
         complete_runtime(runtime, INSTANCE)
     assert isinstance(runtime.run_action.call_args.args[0], FileReadAction)
-
-
-@pytest.mark.parametrize("dataset,policy", [("R2E-Gym", "fix"), ("SWE-bench", "nowarn")])
-def test_preparation_copies_helper_and_captures_policy(patch_runtime, monkeypatch, dataset, policy):
-    runtime, _, _ = patch_runtime
-    monkeypatch.setattr("evaluation.benchmarks.swe_bench.run_infer.DATASET_TYPE", dataset)
-    _prepare_portable_patch(runtime, INSTANCE)
-    runtime.copy_to.assert_called_once()
-    assert runtime.copy_to.call_args.args[0].endswith("/portable_patch.py")
-    preparation = runtime.run_action.call_args.args[0]
-    command = shlex.split(preparation.command)
-    directory = runtime._swe_patch_context
-    workspace = "/testbed" if dataset == "R2E-Gym" else "/workspace/example__repo__1"
-    assert command == [
-        "python", directory + "/portable_patch.py", "prepare", workspace,
-        "base", directory + "/state", policy, "600",
-    ]
-    assert preparation.hard_timeout == 600
-    assert runtime._swe_patch_context.startswith("/tmp/openhands-patch-")
 
 
 def test_saved_portable_patch_is_recognized(tmp_path):
@@ -227,7 +222,7 @@ def test_recovered_patch_keeps_legacy_utf8_block_output(
     )
     text = PREFIX.decode() + "before" + separator + "after\n"
     restored = text + binary if binary_last else binary + text
-    overrides[runtime._swe_patch_context + "/patch.diff"] = FileReadObservation(
+    overrides[PORTABLE + "/patch.diff"] = FileReadObservation(
         content=restored, path="portable"
     )
     result = complete_runtime(runtime, INSTANCE)["git_patch"]
@@ -241,7 +236,7 @@ def test_recovered_patch_keeps_legacy_utf8_block_output(
 def test_recovered_empty_patch_keeps_legacy_empty_string(patch_runtime):
     runtime, patch_file, overrides = patch_runtime
     patch_file.write_bytes(PREFIX + b"\xff\n")
-    overrides[runtime._swe_patch_context + "/patch.diff"] = FileReadObservation(
+    overrides[PORTABLE + "/patch.diff"] = FileReadObservation(
         content="", path="portable"
     )
     assert complete_runtime(runtime, INSTANCE) == {"git_patch": ""}
@@ -252,7 +247,7 @@ def test_recovered_utf8_block_keeps_legacy_partial_header_selection(patch_runtim
     runtime, patch_file, overrides = patch_runtime
     patch_file.write_bytes(PREFIX + b"\xff\n")
     restored = PREFIX.decode() + "prefix\rdiff --git counterfeit\rBinary files marker\n"
-    overrides[runtime._swe_patch_context + "/patch.diff"] = FileReadObservation(
+    overrides[PORTABLE + "/patch.diff"] = FileReadObservation(
         content=restored, path="portable"
     )
     assert complete_runtime(runtime, INSTANCE) == {"git_patch": PREFIX.decode() + "prefix"}

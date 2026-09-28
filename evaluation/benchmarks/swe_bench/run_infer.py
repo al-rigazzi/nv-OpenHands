@@ -395,36 +395,6 @@ def get_config(
     return config
 
 
-def _prepare_portable_patch(runtime: Runtime, instance):
-    """Capture patch-application policy before agent edits, inside its sandbox."""
-    directory = f'/tmp/openhands-patch-{uuid.uuid4().hex}'
-    action = CmdRunAction(command=f'mkdir -m 700 {shlex.quote(directory)}')
-    action.set_hard_timeout(600)
-    obs = runtime.run_action(action)
-    assert_and_raise(
-        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to create portable patch directory: {obs}',
-    )
-    runtime.copy_to(
-        os.path.join(os.path.dirname(__file__), 'portable_patch.py'), directory + '/'
-    )
-    workspace = _get_workspace_path(instance, _get_swebench_workspace_dir_name(instance))
-    # R2E fixes whitespace on application; the built-in SWE evaluator does not.
-    whitespace = 'fix' if DATASET_TYPE == 'R2E-Gym' else 'nowarn'
-    command = shlex.join([
-        'python', directory + '/portable_patch.py', 'prepare', workspace,
-        instance['base_commit'], directory + '/state', whitespace, '600',
-    ])
-    action = CmdRunAction(command=command)
-    action.set_hard_timeout(600)
-    obs = runtime.run_action(action)
-    assert_and_raise(
-        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
-        f'Failed to capture portable patch context: {obs}',
-    )
-    runtime._swe_patch_context = directory
-
-
 def initialize_runtime(
     runtime: Runtime,
     instance: pd.Series,  # this argument is not required
@@ -624,15 +594,6 @@ source ~/.bashrc
             f'Expected to find python interpreter from testbed, but got: {str(obs)}',
         )
 
-    runtime._swe_patch_context = None
-    if DATASET_TYPE != 'SWE-bench-Live':
-        try:
-            _prepare_portable_patch(runtime, instance)
-        except Exception as exc:
-            # Keep the existing UTF-8 path usable on unsupported Git/checkouts.
-            # An undecodable result still fails explicitly without this context.
-            logger.warning('Non-UTF-8 patch recovery unavailable: %s', ascii(str(exc)))
-
     logger.info('-' * 30)
     logger.info('END Runtime Initialization Fn')
     logger.info('-' * 30)
@@ -816,18 +777,18 @@ def complete_runtime(
                     )
                     # Convert only undecodable file diffs to standard Git binary
                     # hunks. Both raw input and portable output stay off the PTY.
-                    directory = getattr(runtime, '_swe_patch_context', None)
-                    assert_and_raise(
-                        isinstance(directory, str),
-                        'Missing pre-agent portable patch context',
+                    directory = f'/tmp/openhands-patch-{uuid.uuid4().hex}'
+                    runtime.copy_to(
+                        os.path.join(os.path.dirname(__file__), 'portable_patch.py'),
+                        directory + '/',
                     )
                     portable_path = directory + '/patch.diff'
                     # Preserve the original extraction fallback's retry budget,
                     # including the helper's internal Git deadline.
                     timeout = max(300 + 100 * n_retries, 600)
                     action = CmdRunAction(command=shlex.join([
-                        'python', directory + '/portable_patch.py', 'normalize',
-                        directory + '/state', 'patch.diff', portable_path, str(timeout),
+                        'python', directory + '/portable_patch.py', '.',
+                        'patch.diff', portable_path, str(timeout),
                     ]))
                     action.set_hard_timeout(timeout)
                     logger.info(action, extra={'msg_type': 'ACTION'})
