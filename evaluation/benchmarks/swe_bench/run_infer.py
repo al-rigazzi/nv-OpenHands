@@ -844,8 +844,6 @@ def complete_runtime(
                         isinstance(obs, FileReadObservation),
                         f'Failed to read portable git patch: {obs}',
                     )
-                    # Already filtered on raw bytes; do not run the legacy text
-                    # filter again, which can alter embedded CR/control bytes.
                     git_patch = obs.content
                     portable = True
                     break
@@ -862,9 +860,11 @@ def complete_runtime(
 
     assert_and_raise(git_patch is not None, 'Failed to get git diff (None)')
 
-    # Remove binary diffs from the patch
-    if not portable:
-        git_patch = remove_binary_diffs(git_patch)
+    git_patch = remove_binary_diffs(git_patch)
+    # The legacy filter drops the blank terminator required by a final binary
+    # hunk. Keep its exact text behavior; restore only that binary terminator.
+    if portable and '\nGIT binary patch\n' in git_patch.rsplit('\ndiff --git ', 1)[-1]:
+        git_patch += '\n'
 
     logger.info('-' * 30)
     logger.info('END Runtime Completion Fn')

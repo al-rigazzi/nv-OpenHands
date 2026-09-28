@@ -3,6 +3,7 @@
 import os
 from pathlib import Path
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -11,9 +12,6 @@ from types import SimpleNamespace
 import pytest
 
 from evaluation.benchmarks.swe_bench.portable_patch import (
-    Git,
-    PatchConversionError,
-    _attribute_path,
     _filter_blocks,
     normalize,
     prepare,
@@ -75,7 +73,10 @@ def convert(case, edits, policy='fix', diff_args=()):
     assert before == source_state()
     if selected.strip():
         git(reference, 'apply', '--whitespace=' + policy, '-', data=selected)
-        git(target, 'apply', '--whitespace=' + policy, '-', data=output.read_bytes())
+        git(
+            target, 'apply', '--whitespace=' + policy, '-',
+            data=b''.join(_filter_blocks(output.read_bytes())),
+        )
 
     def files(directory):
         return {
@@ -149,7 +150,7 @@ def test_empty_blob_transition_applies_and_reverses(case, to_empty):
     assert (target / 'file.txt').read_bytes() == original
 
 
-def test_keeps_valid_blocks_and_omits_original_binary(case):
+def test_keeps_valid_blocks_and_defers_original_binary_notice_filtering(case):
     repo, context, _ = case
     (repo / 'z.bin').write_bytes(b'old\0binary')
     git(repo, 'add', '-A')
@@ -165,7 +166,9 @@ def test_keeps_valid_blocks_and_omits_original_binary(case):
     valid = next(
         b for b in _filter_blocks(raw) if b.startswith(b'diff --git a/valid.txt ')
     )
-    assert valid in portable and b'diff --git a/z.bin ' not in portable
+    assert valid in portable and b'diff --git a/z.bin ' in portable
+    from evaluation.benchmarks.swe_bench.binary_patch_utils import remove_binary_diffs
+    assert 'diff --git a/z.bin ' not in remove_binary_diffs(portable.decode('utf-8'))
 
 
 @pytest.mark.parametrize('operation', ['new', 'delete', 'mode', 'rename', 'symlink'])
@@ -278,7 +281,7 @@ def test_empty_and_malformed(case):
     normalize(context, raw, out)
     assert out.read_bytes() == b''
     raw.write_bytes(b'invalid \xff patch\n')
-    with pytest.raises(PatchConversionError):
+    with pytest.raises(RuntimeError):
         normalize(context, raw, out)
     assert out.read_bytes() == b''
 
@@ -302,7 +305,7 @@ def test_initial_tracked_drift_preserves_raw_git_application(case):
 
 def test_rejects_zero_deadline(case):
     repo, context, base = case
-    with pytest.raises(PatchConversionError, match='time budget'):
+    with pytest.raises(TimeoutError, match='time budget'):
         prepare(repo, base, context, timeout=0)
 
 
@@ -320,37 +323,52 @@ def test_default_budget_allows_git_work_after_ninety_seconds(case, monkeypatch, 
         'evaluation.benchmarks.swe_bench.portable_patch.time',
         SimpleNamespace(monotonic=lambda: clock[0]),
     )
-    original = Git.run
+    original = subprocess.run
+    budgets = []
 
-    def delayed_git(self, *args, **kwargs):
+    def delayed_git(*args, **kwargs):
+        budgets.append(kwargs['timeout'])
         clock[0] = 120  # Simulate slow work without a real two-minute sleep.
-        return original(self, *args, **kwargs)
+        return original(*args, **kwargs)
 
-    monkeypatch.setattr(Git, 'run', delayed_git)
+    monkeypatch.setattr(subprocess, 'run', delayed_git)
     if operation == 'prepare':
         prepare(repo, base, context)
         assert (context / 'state.json').is_file()
     else:
         normalize(context, patch, output)
         assert 'GIT binary patch' in output.read_text(encoding='utf-8')
+    assert budgets[0] == 600 and 480 in budgets
 
 
 def test_old_git_attribute_path_fallback(case, monkeypatch):
-    repo, _, _ = case
-    runner = Git(repo, 5)
-    original = runner.run
+    repo, context, base = case
+    monkeypatch.delenv('GIT_ATTR_NOSYSTEM')
+    attrs = repo.parent / 'global-attrs'
+    attrs.write_bytes(b'file.txt -whitespace\n')
+    original = subprocess.run
+    calls = []
 
-    def old_git(*args, **kwargs):
-        if args[0] == 'var':
-            return b''
-        if args[0] == '--exec-path':
-            return b'/usr/lib/git-core\n'
-        return original(*args, **kwargs)
+    def old_git(command, **kwargs):
+        calls.append(command)
+        if 'var' in command and command[-1].startswith('GIT_ATTR_'):
+            return subprocess.CompletedProcess(command, 1, b'', b'')
+        if '--exec-path' in command:
+            return subprocess.CompletedProcess(command, 0, b'/usr/lib/git-core\n', b'')
+        return original(command, **kwargs)
 
-    monkeypatch.setattr(runner, 'run', old_git)
-    runner.env.pop('GIT_ATTR_NOSYSTEM')
-    assert _attribute_path(runner, 'GIT_ATTR_SYSTEM') == Path('/etc/gitattributes')
-    assert _attribute_path(runner, 'GIT_ATTR_GLOBAL') == repo.parent / 'global-attrs'
+    monkeypatch.setattr(subprocess, 'run', old_git)
+    prepare(repo, base, context)
+    assert any('--exec-path' in command for command in calls)
+    attrs.write_bytes(b'file.txt whitespace\n')
+    (repo / 'file.txt').write_bytes(b'changed \xff  \t\n')
+    git(repo, 'add', '-A')
+    raw, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    raw.write_bytes(git(repo, 'diff', '--cached', base))
+    normalize(context, raw, output)
+    git(repo, 'reset', '--hard', base)
+    git(repo, 'apply', '--whitespace=fix', str(output))
+    assert (repo / 'file.txt').read_bytes() == b'changed \xff  \t\n'
 
 
 @pytest.mark.parametrize('source', ['global', 'info', 'config', 'ignored'])
@@ -471,3 +489,256 @@ def test_cli_failure_diagnostics_cannot_emit_terminal_controls(case):
         marker in result.stderr for marker in (b'xff', b'x1b', b'Punterminated')
     )
     assert b'z.txt: patch does not apply' in result.stderr
+
+
+@pytest.mark.parametrize(
+    'content',
+    [
+        b'plain UTF-8\n',
+        'caf\u00e9\n'.encode(),
+        b'vertical\x0btab\n',
+        b'form\x0cfeed\n',
+        'next\u0085line\n'.encode(),
+        'line\u2028separator\n'.encode(),
+        'paragraph\u2029separator\n'.encode(),
+        b'carriage\rreturn\r\n',
+        b'without final newline',
+        b'with final newline\n',
+        b'prefix\rdiff --git counterfeit\rBinary files marker\n',
+    ],
+)
+@pytest.mark.parametrize('valid_name', ['a-valid.txt', 'z-valid.txt'])
+def test_mixed_fallback_preserves_every_valid_block_byte(case, content, valid_name):
+    # The helper's responsibility ends at byte-safe representation. The runtime
+    # must still run the original text filter, including its splitlines policy.
+    from evaluation.benchmarks.swe_bench.binary_patch_utils import remove_binary_diffs
+
+    repo, context, base = case
+    prepare(repo, base, context)
+    (repo / 'file.txt').write_bytes(b'undecodable \xff\n')
+    (repo / valid_name).write_bytes(content)
+    git(repo, 'add', '-A')
+    raw = git(repo, 'diff', '--no-color', '--cached', base)
+    valid = next(
+        block for block in re.split(rb'(?m)(?=^diff --git )', raw)
+        if block.startswith(f'diff --git a/{valid_name} '.encode())
+    )
+    patch, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    patch.write_bytes(raw)
+    normalize(context, patch, output)
+    converted = output.read_bytes()
+    assert valid in converted
+    assert converted.count(b'GIT binary patch\n') == 1
+    # Valid-file output is exactly the old caller's result, even where the old
+    # filter intentionally changes CRLF, control characters, or the last LF.
+    final = remove_binary_diffs(converted.decode('utf-8'))
+    expected = remove_binary_diffs(valid.decode('utf-8'))
+    start = final.index(f'diff --git a/{valid_name} ')
+    end = final.find('\ndiff --git ', start)
+    actual = final[start:] if end < 0 else final[start:end]
+    assert actual == expected
+
+
+@pytest.mark.parametrize('direction', ['file_to_directory', 'directory_to_file'])
+def test_mixed_file_directory_transition_uses_complete_index_change(case, direction):
+    repo, context, _ = case
+    path = repo / 'foo'
+    if direction == 'file_to_directory':
+        path.write_bytes(b'original valid text\n')
+    else:
+        path.mkdir()
+        (path / 'bar').write_bytes(b'original valid text\n')
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-qm', 'path transition base')
+    case = repo, context, git(repo, 'rev-parse', 'HEAD').decode().strip()
+
+    def edits(repo):
+        if direction == 'file_to_directory':
+            path.unlink()
+            path.mkdir()
+            (path / 'bar').write_bytes(b'new undecodable \xff\n')
+        else:
+            (path / 'bar').unlink()
+            path.rmdir()
+            path.write_bytes(b'new undecodable \xff\n')
+
+    raw, portable, _ = convert(case, edits)
+    deletion = next(
+        block for block in _filter_blocks(raw) if b'deleted file mode ' in block
+    )
+    assert deletion in portable
+    assert portable.count(b'GIT binary patch\n') == 1
+
+
+def test_all_utf8_blocks_do_not_run_application_policy(case, monkeypatch):
+    repo, context, base = case
+    prepare(repo, base, context)
+    (repo / 'file.txt').write_bytes(b'valid trailing  \t\n')
+    git(repo, 'add', '-A')
+    raw = git(repo, 'diff', '--cached', base)
+    patch, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    patch.write_bytes(raw)
+    original = subprocess.run
+
+    def reject_application(command, **kwargs):
+        assert not ('apply' in command and '--cached' in command)
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', reject_application)
+    normalize(context, patch, output)
+    assert output.read_bytes() == raw
+
+
+def test_fix_encodes_the_evaluators_result_not_unfixed_file_bytes(case):
+    _, portable, target = convert(
+        case, lambda repo: (repo / 'file.txt').write_bytes(b'changed \xff  \t\n')
+    )
+    assert b'GIT binary patch\n' in portable
+    assert (target / 'file.txt').read_bytes() == b'changed \xff\n'
+
+
+@pytest.mark.parametrize('operation', ['prepare', 'normalize'])
+def test_git_timeout_is_reported_without_output_or_source_mutation(
+    case, monkeypatch, operation
+):
+    repo, context, base = case
+    patch, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    if operation == 'normalize':
+        prepare(repo, base, context)
+        (repo / 'file.txt').write_bytes(b'changed \xff\n')
+        git(repo, 'add', '-A')
+        patch.write_bytes(git(repo, 'diff', '--cached', base))
+    observed = [repo / '.git/index', repo / '.git/config', repo / 'file.txt']
+    before = {path: path.read_bytes() for path in observed}
+
+    def timeout(command, **kwargs):
+        raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+
+    monkeypatch.setattr(subprocess, 'run', timeout)
+    with pytest.raises(subprocess.TimeoutExpired):
+        if operation == 'prepare':
+            prepare(repo, base, context, timeout=7)
+        else:
+            normalize(context, patch, output, timeout=7)
+    assert not output.exists()
+    assert {path: path.read_bytes() for path in observed} == before
+
+
+def test_sha256_repository_uses_full_blob_ids_and_reversible_literals(case):
+    original, context, _ = case
+    repo = original.parent / 'sha256'
+    repo.mkdir()
+    git(repo, 'init', '-q', '--object-format=sha256')
+    git(repo, 'config', 'user.name', 'Synthetic')
+    git(repo, 'config', 'user.email', 'test@example.invalid')
+    (repo / 'file.txt').write_bytes(b'base\n')
+    git(repo, 'add', '-A')
+    git(repo, 'commit', '-qm', 'SHA256 base')
+    base = git(repo, 'rev-parse', 'HEAD').decode().strip()
+    _, portable, target = convert(
+        (repo, context, base),
+        lambda path: (path / 'file.txt').write_bytes(b'new \xff\n'),
+    )
+    index = next(line for line in portable.splitlines() if line.startswith(b'index '))
+    old, new = index.split()[1].split(b'..')
+    assert len(old) == len(new) == 64
+    git(target, 'apply', '--reverse', '-', data=portable)
+    assert (target / 'file.txt').read_bytes() == b'base\n'
+
+
+@pytest.mark.parametrize('xdg', ['', None])
+def test_old_git_missing_xdg_uses_home_attributes(case, monkeypatch, xdg):
+    repo, context, base = case
+    git(repo, 'config', '--unset', 'core.attributesFile')
+    fallback_home = repo.parent / 'fallback-home'
+    attrs = fallback_home / '.config/git/attributes'
+    attrs.parent.mkdir(parents=True)
+    attrs.write_bytes(b'file.txt -whitespace\n')
+    monkeypatch.setattr(Path, 'home', classmethod(lambda cls: fallback_home))
+    if xdg is None:
+        monkeypatch.delenv('XDG_CONFIG_HOME', raising=False)
+    else:
+        monkeypatch.setenv('XDG_CONFIG_HOME', xdg)
+    original = subprocess.run
+
+    def old_git(command, **kwargs):
+        if 'var' in command and command[-1] == 'GIT_ATTR_GLOBAL':
+            return subprocess.CompletedProcess(command, 1, b'', b'')
+        return original(command, **kwargs)
+
+    monkeypatch.setattr(subprocess, 'run', old_git)
+    prepare(repo, base, context)
+    attrs.write_bytes(b'file.txt whitespace\n')
+    (repo / 'file.txt').write_bytes(b'changed \xff  \t\n')
+    git(repo, 'add', '-A')
+    raw, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    raw.write_bytes(git(repo, 'diff', '--cached', base))
+    normalize(context, raw, output)
+    git(repo, 'reset', '--hard', base)
+    git(repo, 'apply', '--whitespace=fix', str(output))
+    assert (repo / 'file.txt').read_bytes() == b'changed \xff  \t\n'
+
+
+def test_prepare_deadline_covers_policy_file_copy(case, monkeypatch):
+    repo, context, base = case
+    attrs = repo / '.gitattributes'
+    attrs.write_bytes(b'file.txt -whitespace\n')
+    observed = [repo / '.git/index', repo / '.git/config', attrs]
+    before = {path: path.read_bytes() for path in observed}
+    clock = [0]
+    monkeypatch.setattr(
+        'evaluation.benchmarks.swe_bench.portable_patch.time',
+        SimpleNamespace(monotonic=lambda: clock[0]),
+    )
+    original = Path.read_bytes
+
+    def delayed_copy(path):
+        result = original(path)
+        if path == attrs:
+            clock[0] = 8
+        return result
+
+    monkeypatch.setattr(Path, 'read_bytes', delayed_copy)
+    with pytest.raises(TimeoutError, match='time budget'):
+        prepare(repo, base, context, timeout=7)
+    assert (context / 'worktree/.gitattributes').is_file()
+    assert not (context / 'state.json').exists()
+    assert {path: path.read_bytes() for path in observed} == before
+
+
+def test_external_object_store_preserves_source_and_converts(case, monkeypatch):
+    repo, context, base = case
+    target = repo.parent / 'target'
+    shutil.copytree(repo, target)
+    objects = repo.parent / 'external-objects'
+    shutil.move(repo / '.git/objects', objects)
+    monkeypatch.setenv('GIT_OBJECT_DIRECTORY', str(objects))
+
+    def source_state():
+        tracked = [repo / '.git/index', repo / '.git/config', repo / 'file.txt']
+        return (
+            git(repo, 'rev-parse', 'HEAD'),
+            {path: path.read_bytes() for path in tracked},
+            {
+                path.relative_to(objects): path.read_bytes()
+                for path in objects.rglob('*') if path.is_file()
+            },
+        )
+
+    before = source_state()
+    prepare(repo, base, context)
+    assert source_state() == before
+    (repo / 'file.txt').write_bytes(b'changed \xff  \t\n')
+    git(repo, 'add', '-A')
+    raw, output = repo.parent / 'raw.patch', repo.parent / 'out.patch'
+    raw.write_bytes(git(repo, 'diff', '--cached', base))
+    before = source_state()
+    normalize(context, raw, output)
+    assert source_state() == before
+    assert not (repo / '.git/objects').exists()
+    with monkeypatch.context() as target_environment:
+        target_environment.delenv('GIT_OBJECT_DIRECTORY')
+        git(target, 'apply', '--whitespace=fix', str(output))
+        assert (target / 'file.txt').read_bytes() == b'changed \xff\n'
+        git(target, 'apply', '--reverse', str(output))
+        assert (target / 'file.txt').read_bytes() == b'base\n'
