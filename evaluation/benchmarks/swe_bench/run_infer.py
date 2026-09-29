@@ -2,8 +2,10 @@ import asyncio
 import copy
 import json
 import os
+import shlex
 import shutil
 import tempfile
+import uuid
 from typing import Any, Dict, Literal, Optional
 import time
 import pandas as pd
@@ -747,6 +749,7 @@ def complete_runtime(
 
     n_retries = 0
     git_patch = None
+    portable = False
     while n_retries < 5:
         action = CmdRunAction(
             command=f'git diff --no-color --cached {instance["base_commit"]} > patch.diff'
@@ -768,15 +771,42 @@ def complete_runtime(
                     git_patch = obs.content
                     break
                 elif isinstance(obs, ErrorObservation):
-                    # Fall back to cat "patch.diff" to get the patch
-                    assert 'File could not be decoded as utf-8' in obs.content
-                    action = CmdRunAction(command='cat patch.diff')
-                    action.set_hard_timeout(max(300 + 100 * n_retries, 600))
+                    assert_and_raise(
+                        'File could not be decoded as utf-8' in obs.content,
+                        f'Failed to read git patch: {obs}',
+                    )
+                    # Convert only undecodable file diffs to standard Git binary
+                    # hunks. Both raw input and portable output stay off the PTY.
+                    directory = f'/tmp/openhands-patch-{uuid.uuid4().hex}'
+                    runtime.copy_to(
+                        os.path.join(os.path.dirname(__file__), 'portable_patch.py'),
+                        directory + '/',
+                    )
+                    portable_path = directory + '/patch.diff'
+                    # Preserve the original extraction fallback's retry budget,
+                    # including the helper's internal Git deadline.
+                    timeout = max(300 + 100 * n_retries, 600)
+                    action = CmdRunAction(command=shlex.join([
+                        'python', directory + '/portable_patch.py', '.',
+                        'patch.diff', portable_path, str(timeout),
+                    ]))
+                    action.set_hard_timeout(timeout)
                     logger.info(action, extra={'msg_type': 'ACTION'})
                     obs = runtime.run_action(action)
-                    assert isinstance(obs, CmdOutputObservation) and obs.exit_code == 0
+                    assert_and_raise(
+                        isinstance(obs, CmdOutputObservation) and obs.exit_code == 0,
+                        f'Failed to make UTF-8 Git patch: {obs}',
+                    )
                     logger.info(obs, extra={'msg_type': 'OBSERVATION'})
+                    action = FileReadAction(path=portable_path)
+                    action.set_hard_timeout(timeout)
+                    obs = runtime.run_action(action)
+                    assert_and_raise(
+                        isinstance(obs, FileReadObservation),
+                        f'Failed to read portable git patch: {obs}',
+                    )
                     git_patch = obs.content
+                    portable = True
                     break
                 else:
                     assert_and_raise(False, f'Unexpected observation type: {str(obs)}')
@@ -791,8 +821,11 @@ def complete_runtime(
 
     assert_and_raise(git_patch is not None, 'Failed to get git diff (None)')
 
-    # Remove binary diffs from the patch
     git_patch = remove_binary_diffs(git_patch)
+    # The legacy filter drops the blank terminator required by a final binary
+    # hunk. Keep its exact text behavior; restore only that binary terminator.
+    if portable and '\nGIT binary patch\n' in git_patch.rsplit('\ndiff --git ', 1)[-1]:
+        git_patch += '\n'
 
     logger.info('-' * 30)
     logger.info('END Runtime Completion Fn')
