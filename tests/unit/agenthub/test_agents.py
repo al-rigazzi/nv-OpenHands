@@ -159,7 +159,6 @@ def test_cmd_run_tool():
     assert 'security_risk' in CmdRunTool['function']['parameters']['properties']
     assert CmdRunTool['function']['parameters']['required'] == [
         'command',
-        'security_risk',
     ]
 
 
@@ -170,7 +169,6 @@ def test_ipython_tool():
     assert 'security_risk' in IPythonTool['function']['parameters']['properties']
     assert IPythonTool['function']['parameters']['required'] == [
         'code',
-        'security_risk',
     ]
 
 
@@ -209,7 +207,6 @@ def test_str_replace_editor_tool():
     assert StrReplaceEditorTool['function']['parameters']['required'] == [
         'command',
         'path',
-        'security_risk',
     ]
 
 
